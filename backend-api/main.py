@@ -1,9 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import yfinance as yf
+import requests
 import pandas as pd
 from datetime import datetime, timedelta
-import json
 
 app = FastAPI()
 
@@ -25,14 +24,13 @@ SP500 = [
 NASDAQ100_EXTRA = [
     "ASML","MELI","ABNB","CRWD","DXCM","FANG","FTNT","IDXX","ILMN","KDP",
     "LCID","LULU","MAR","MRNA","MTCH","MU","NFLX","ODFL","ON","PAYX","PCAR",
-    "PDD","REGN","RIVN","ROST","SGEN","SIRI","TEAM","TTD","VRSK","VRTX","WBD",
-    "WBA","WDAY","XEL","ZM","ZS"
+    "PDD","REGN","RIVN","ROST","TEAM","TTD","VRSK","VRTX","WDAY","ZM","ZS"
 ]
 
 HIGH_VOL_OPTIONS = [
     "SPY","QQQ","IWM","GLD","SLV","TLT","XLE","XLF","XLK","ARKK",
     "BABA","NFLX","SNAP","UBER","LYFT","COIN","HOOD","PLTR","RBLX","SOFI",
-    "AMC","GME","BBBY","SPCE","MARA","RIOT","HUT","SNDL","TLRY","CGC"
+    "AMC","GME","MARA","RIOT","SNDL","TLRY","CGC"
 ]
 
 cache = {}
@@ -54,6 +52,43 @@ def is_cache_valid(key: str) -> bool:
     age = datetime.now() - cache[key]["timestamp"]
     return age < timedelta(hours=CACHE_TTL_HOURS)
 
+def fetch_nasdaq_earnings(date_str: str) -> list:
+    """
+    Fetches earnings for a specific date from Nasdaq's free calendar API.
+    Returns list of dicts with ticker, name, time (BMO/AMC).
+    """
+    url = f"https://api.nasdaq.com/api/calendar/earnings?date={date_str}"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        rows = data.get("data", {}).get("rows", []) or []
+        results = []
+        for row in rows:
+            ticker = row.get("symbol", "").strip()
+            name = row.get("name", "").strip()
+            time_raw = row.get("time", "").strip()
+            if not ticker:
+                continue
+            if "pre-market" in time_raw.lower():
+                time = "BMO"
+            elif "after-hours" in time_raw.lower():
+                time = "AMC"
+            else:
+                time = "TBD"
+            results.append({
+                "ticker": ticker,
+                "name": name,
+                "time": time,
+                "date": date_str,
+            })
+        return results
+    except Exception:
+        return []
+
 @app.get("/")
 def root():
     return {"status": "Insignia API running"}
@@ -64,48 +99,40 @@ def get_earnings(universe: str = "all", weeks: int = 4):
     if is_cache_valid(cache_key):
         return cache[cache_key]["data"]
 
-    tickers = get_universe(universe)
+    universe_tickers = set(get_universe(universe))
     today = datetime.today().date()
-    end_date = today + timedelta(weeks=weeks)
-    results = []
-
-    for sym in tickers:
-        try:
-            tk = yf.Ticker(sym)
-            cal = tk.calendar
-            if cal is None:
-                continue
-            if isinstance(cal, dict):
-                earn_date = cal.get("Earnings Date")
-                if earn_date is None:
-                    continue
-                if isinstance(earn_date, list):
-                    earn_date = earn_date[0]
-                if hasattr(earn_date, "date"):
-                    earn_date = earn_date.date()
-                if not (today <= earn_date <= end_date):
-                    continue
-                results.append({
-                    "ticker": sym,
-                    "date": str(earn_date),
-                    "time": cal.get("Earnings Time", "TBD"),
-                })
-        except Exception:
-            continue
-
-    results.sort(key=lambda x: x["date"])
-
     grouped = {}
-    for r in results:
-        d = r["date"]
-        if d not in grouped:
-            grouped[d] = []
-        grouped[d].append(r)
+    total = 0
 
-    response = {"grouped": grouped, "total": len(results), "universe": universe}
+    for i in range(weeks * 7):
+        date = today + timedelta(days=i)
+        # Skip weekends
+        if date.weekday() >= 5:
+            continue
+        date_str = str(date)
+        rows = fetch_nasdaq_earnings(date_str)
+        filtered = [r for r in rows if r["ticker"] in universe_tickers]
+        if filtered:
+            grouped[date_str] = filtered
+            total += len(filtered)
+
+    response = {"grouped": grouped, "total": total, "universe": universe}
     cache[cache_key] = {"data": response, "timestamp": datetime.now()}
     return response
 
+@app.get("/debug/{date_str}")
+def debug_nasdaq(date_str: str):
+    url = f"https://api.nasdaq.com/api/calendar/earnings?date={date_str}"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
+    
 @app.get("/straddle/{ticker}")
 def get_straddle(ticker: str):
     return {
