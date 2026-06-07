@@ -9,19 +9,59 @@ const FILTERS = [
   { key: "highvol", label: "High Vol" },
 ];
 
+const US_HOLIDAYS = new Set([
+  "2026-01-01","2026-01-19","2026-02-16","2026-04-03","2026-05-25",
+  "2026-07-03","2026-09-07","2026-11-26","2026-12-25",
+  "2027-01-01","2027-01-18","2027-02-15","2027-04-02","2027-05-31",
+  "2027-07-05","2027-09-06","2027-11-25","2027-12-24",
+]);
+
+function isNonTradingDay(date) {
+  const day = date.getDay();
+  if (day === 0 || day === 6) return true;
+  const str = date.toISOString().split("T")[0];
+  return US_HOLIDAYS.has(str);
+}
+
+function tradingDaysUntil(dateStr, time) {
+  if (!dateStr) return null;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const earnDate = new Date(dateStr + "T00:00:00");
+
+  const lastDayToAct = new Date(earnDate);
+  if (time === "BMO") {
+    lastDayToAct.setDate(lastDayToAct.getDate() - 1);
+    while (isNonTradingDay(lastDayToAct)) {
+      lastDayToAct.setDate(lastDayToAct.getDate() - 1);
+    }
+  }
+
+  const startDay = new Date(today);
+  while (isNonTradingDay(startDay)) {
+    startDay.setDate(startDay.getDate() + 1);
+  }
+
+  let count = 0;
+  const cursor = new Date(startDay);
+  while (cursor <= lastDayToAct) {
+    if (!isNonTradingDay(cursor)) count++;
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  if (count <= 0) return "Reported";
+  if (time === "BMO") {
+    const daysLeft = count - 1;
+    if (daysLeft === 0) return "0 Days Before Earnings";
+    return `${daysLeft} Day${daysLeft !== 1 ? "s" : ""} Before Earnings`;
+  }
+  if (count === 0) return "0 Days Before Earnings";
+  return `${count} Day${count !== 1 ? "s" : ""} Before Earnings`;
+}
+
 function formatDate(dateStr) {
   const d = new Date(dateStr + "T00:00:00");
   return d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
-}
-
-function daysUntil(dateStr) {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const d = new Date(dateStr + "T00:00:00");
-  const diff = Math.round((d - today) / (1000 * 60 * 60 * 24));
-  if (diff === 0) return "Today";
-  if (diff === 1) return "Tomorrow";
-  return `In ${diff} days`;
 }
 
 function TimeBadge({ time }) {
@@ -60,7 +100,6 @@ export default function EarningsScreen({ onTab }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, fontFamily: "system-ui, sans-serif" }}>
 
-      {/* Header */}
       <div style={{ padding: "18px 20px 12px", borderBottom: "0.5px solid #eee" }}>
         <h1 style={{ fontSize: 20, fontWeight: 500, margin: "0 0 14px" }}>Earnings Calendar</h1>
         <div style={{ display: "flex", gap: 8 }}>
@@ -83,9 +122,7 @@ export default function EarningsScreen({ onTab }) {
         </div>
       </div>
 
-      {/* Body */}
       <div style={{ flex: 1, overflowY: "auto", paddingBottom: 16 }}>
-
         {loading && (
           <div style={{ padding: "60px 20px", textAlign: "center" }}>
             <div style={{ fontSize: 13, color: "#aaa", marginBottom: 8 }}>Loading earnings data...</div>
@@ -107,14 +144,12 @@ export default function EarningsScreen({ onTab }) {
 
         {data && !loading && Object.entries(data.grouped).map(([date, items]) => (
           <div key={date}>
-            {/* Date header */}
             <div style={{ padding: "12px 20px 6px", display: "flex", alignItems: "baseline", gap: 8, background: "#fafaf8", borderBottom: "0.5px solid #eee" }}>
               <span style={{ fontSize: 13, fontWeight: 600 }}>{formatDate(date)}</span>
-              <span style={{ fontSize: 11, color: "#aaa" }}>{daysUntil(date)}</span>
+              <span style={{ fontSize: 11, color: "#aaa" }}>{tradingDaysUntil(date, items[0]?.time)}</span>
               <span style={{ fontSize: 11, color: "#bbb", marginLeft: "auto" }}>{items.length} {items.length === 1 ? "company" : "companies"}</span>
             </div>
 
-            {/* Ticker rows */}
             {items.map(item => {
               const isWatchlist = WATCHLIST.includes(item.ticker);
               return (
@@ -135,7 +170,9 @@ export default function EarningsScreen({ onTab }) {
                       )}
                     </div>
                     {item.name && (
-                      <div style={{ fontSize: 11, color: "#aaa" }}>{item.name}</div>
+                      <div style={{ fontSize: 11, color: "#aaa" }}>
+                        {item.name} · {tradingDaysUntil(item.date, item.time)}
+                      </div>
                     )}
                   </div>
                   <TimeBadge time={item.time} />
