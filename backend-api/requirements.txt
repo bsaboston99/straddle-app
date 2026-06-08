@@ -1,5 +1,6 @@
 fastapi
-uvicorn
-yfinance
+uvicorn[standard]
 pandas
+pyarrow
+scipy
 requests

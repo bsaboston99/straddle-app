@@ -100,4 +100,4 @@ export const tickers = {
 };
 
 export const WATCHLIST = Object.keys(tickers);
-export const API_BASE = "https://insignia-api-qkex.onrender.com";
+export const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";

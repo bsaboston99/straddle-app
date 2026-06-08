@@ -1,0 +1,81 @@
+*, *::before, *::after { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
+}
+
+/* ── Dark theme (default) ── */
+:root {
+  --bg:          #111113;
+  --surface:     #1c1c1e;
+  --border:      #2c2c2e;
+  --text:        #f2f2f7;
+  --text2:       #8e8e93;
+  --text3:       #636366;
+  --text4:       #48484a;
+  --up:          #30d158;
+  --up-bg:       #0d2118;
+  --down:        #ff453a;
+  --down-bg:     #2a100e;
+  --blue:        #0a84ff;
+  --blue-bg:     #0a1929;
+  --purple:      #bf5af2;
+  --purple-bg:   #1e0a2a;
+  --earn-bg:     #2e1f06;
+  --earn-text:   #e6a01a;
+  --chart-grid:  #2c2c2e;
+  --chart-zero:  #48484a;
+  --chart-axis:  #636366;
+  --warn-bg:     #2e1f06;
+  --warn-text:   #e6a01a;
+  --warn-body:   #c8861a;
+  --ok-bg:       #0d2118;
+  --ok-text:     #30d158;
+  --ok-body:     #28b14c;
+}
+
+/* ── Light theme ── */
+[data-theme="light"] {
+  --bg:          #f2f2f7;
+  --surface:     #ffffff;
+  --border:      #d1d1d6;
+  --text:        #1c1c1e;
+  --text2:       #636366;
+  --text3:       #8e8e93;
+  --text4:       #c7c7cc;
+  --up:          #34c759;
+  --up-bg:       #d4f4df;
+  --down:        #ff3b30;
+  --down-bg:     #ffd7d5;
+  --blue:        #007aff;
+  --blue-bg:     #e3f0ff;
+  --purple:      #8944ab;
+  --purple-bg:   #f3e8ff;
+  --earn-bg:     #fff3cd;
+  --earn-text:   #9a5a00;
+  --chart-grid:  #e5e5ea;
+  --chart-zero:  #c7c7cc;
+  --chart-axis:  #8e8e93;
+  --warn-bg:     #fff3cd;
+  --warn-text:   #9a5a00;
+  --warn-body:   #7a4600;
+  --ok-bg:       #d4f4df;
+  --ok-text:     #1a7a3c;
+  --ok-body:     #145e2e;
+}
+
+/* ── Slim scrollbar ── */
+::-webkit-scrollbar { width: 3px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+* { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+/* ── Input resets ── */
+input { font-family: inherit; }
+input::placeholder { color: var(--text4); }
+
+/* ── Safe area for notched iPhones ── */
+.safe-bottom { padding-bottom: env(safe-area-inset-bottom, 0px); }
