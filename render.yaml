@@ -18,7 +18,7 @@ services:
     staticPublishPath: dist
     envVars:
       - key: VITE_API_BASE
-        value: https://insignia-api.onrender.com   # update after backend deploys
+        value: https://insignia-api-qkex.onrender.com
     routes:
       - type: rewrite
         source: /*
