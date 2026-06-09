@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
-import { API_BASE, WATCHLIST } from "../data/tickers";
+import { API_BASE } from "../data/tickers";
+const WATCHLIST = [];
 import TabBar from "./TabBar";
 
 const FILTERS = [
