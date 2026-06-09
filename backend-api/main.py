@@ -563,6 +563,17 @@ def send_push(subscription: dict, title: str, body: str):
         print(f"Push send error: {e}")
 
 
+@app.post("/push/test")
+def test_push():
+    """Send a test push notification to all subscribers."""
+    subs = load_subscriptions()
+    if not subs:
+        return {"status": "no subscribers"}
+    for sub in subs:
+        send_push(sub, title="Insignia Test", body="Push notifications are working ✓")
+    return {"status": "sent", "count": len(subs)}
+
+
 @app.post("/alerts/trigger")
 def trigger_alerts():
     """Check watchlist straddle percentiles against threshold and push alerts."""

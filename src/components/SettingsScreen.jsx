@@ -211,6 +211,26 @@ export default function SettingsScreen({ onTab, isDark, setIsDark }) {
                   {pushNote}
                 </div>
               )}
+
+              {/* Test notification button */}
+              {pushStatus === "granted" && (
+                <button
+                  onClick={() => {
+                    fetch(`${API_BASE}/push/test`, { method: "POST" })
+                      .then(r => r.json())
+                      .then(d => d.status === "sent" ? alert("Test notification sent!") : alert("No subscribers found — try toggling alerts off and on."))
+                      .catch(() => alert("Request failed."));
+                  }}
+                  style={{
+                    marginTop: 14, width: "100%", padding: "10px 0",
+                    background: "var(--blue)", color: "#fff",
+                    border: "none", borderRadius: 10,
+                    fontSize: 14, fontWeight: 500, cursor: "pointer"
+                  }}
+                >
+                  Send Test Notification
+                </button>
+              )}
             </div>
           )}
         </div>
