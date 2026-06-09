@@ -63,6 +63,15 @@ export default function SettingsScreen({ onTab, isDark, setIsDark }) {
   });
   const [pushStatus, setPushStatus] = useState("idle"); // idle | requesting | granted | denied | error
 
+  // Restore push status on mount if permission was already granted
+  useEffect(() => {
+    if (alertsEnabled && "Notification" in window && Notification.permission === "granted") {
+      setPushStatus("granted");
+    } else if ("Notification" in window && Notification.permission === "denied") {
+      setPushStatus("denied");
+    }
+  }, []);
+
   useEffect(() => {
     try { localStorage.setItem("alerts_enabled", String(alertsEnabled)); } catch {}
   }, [alertsEnabled]);
