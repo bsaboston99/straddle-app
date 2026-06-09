@@ -553,10 +553,12 @@ def send_push(subscription: dict, title: str, body: str):
     """Send a single Web Push notification."""
     try:
         from pywebpush import webpush, WebPushException
+        # Env vars lose real newlines — restore them from literal \n
+        private_key = VAPID_PRIVATE_KEY.replace("\\n", "\n")
         webpush(
             subscription_info=subscription,
             data=json.dumps({"title": title, "body": body}),
-            vapid_private_key=VAPID_PRIVATE_KEY,
+            vapid_private_key=private_key,
             vapid_claims=VAPID_CLAIMS,
         )
     except Exception as e:
