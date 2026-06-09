@@ -222,7 +222,7 @@ export default function SettingsScreen({ onTab, isDark, setIsDark }) {
               )}
 
               {/* Test notification button */}
-              {pushStatus === "granted" && (
+              {(
                 <button
                   onClick={() => {
                     fetch(`${API_BASE}/push/test`, { method: "POST" })
@@ -239,7 +239,8 @@ export default function SettingsScreen({ onTab, isDark, setIsDark }) {
                 >
                   Send Test Notification
                 </button>
-              )}
+              )
+              }
             </div>
           )}
         </div>

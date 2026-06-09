@@ -1,28 +1,26 @@
 import { useState, useEffect } from "react";
-import { tickers, API_BASE } from "../data/tickers";
+import { API_BASE } from "../data/tickers";
 import { MiniBar } from "./MiniBar";
 import TabBar from "./TabBar";
 
 // Deterministic seeded random — same ticker always gets the same dummy values
 function seededRand(seed, offset = 0) {
   const x = Math.sin(seed * 127.1 + offset * 311.7) * 43758.5453;
-  return x - Math.floor(x); // 0..1
+  return x - Math.floor(x);
 }
 
 function dummyTicker(sym) {
   const seed = sym.split("").reduce((a, c, i) => a + c.charCodeAt(0) * (i + 1), 0);
   const r = (min, max, off) => min + seededRand(seed, off) * (max - min);
-
   const price     = r(18, 480, 1);
   const changePct = r(-4.5, 4.5, 2);
   const isUp      = changePct >= 0;
-  const stPct     = r(2.5, 11, 3);          // straddle as % of price
+  const stPct     = r(2.5, 11, 3);
   const stDollar  = price * stPct / 100;
   const pct_a     = Math.round(r(8, 92, 4));
   const pct_b     = Math.round(r(8, 92, 5));
   const pct_ep    = Math.round(r(8, 92, 6));
   const sig       = p => p <= 25 ? "CHEAP" : p >= 75 ? "RICH" : "NORMAL";
-
   return {
     name:     sym,
     price:    `$${price.toFixed(2)}`,
@@ -31,9 +29,7 @@ function dummyTicker(sym) {
     front:    `$${stDollar.toFixed(2)}`,
     frontPct: `${stPct.toFixed(2)}% of price`,
     pct_a, pct_b, pct_ep,
-    sig_a:  sig(pct_a),
-    sig_b:  sig(pct_b),
-    sig_ep: sig(pct_ep),
+    sig_a: sig(pct_a), sig_b: sig(pct_b), sig_ep: sig(pct_ep),
   };
 }
 
@@ -102,19 +98,12 @@ function earnBadgeDate(dateStr) {
   return new Date(dateStr + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
-function TickerRow({ sym, onClick, earningsMap, straddleMap }) {
-  const t = tickers[sym] ?? dummyTicker(sym);
+function TickerRow({ sym, onClick, earningsMap }) {
+  const t = dummyTicker(sym);
   const isUp = t.dir === "up";
   const earnInfo = earningsMap[sym] || null;
   const badge = earnInfo ? earnBadgeDate(earnInfo.date) : null;
   const subLabel = earnInfo ? tradingDaysUntil(earnInfo.date, earnInfo.time) : "Date TBD";
-  const sd = straddleMap[sym];
-  const pct_a  = sd ? sd.pct_a     : t.pct_a;
-  const pct_b  = sd ? sd.pct_b     : t.pct_b;
-  const pct_ep = sd ? sd.pct_ep    : t.pct_ep;
-  const sig_a  = sd ? sd.signal_a  : t.sig_a;
-  const sig_b  = sd ? sd.signal_b  : t.sig_b;
-  const sig_ep = sd ? sd.signal_ep : t.sig_ep;
 
   return (
     <div onClick={onClick} style={{
@@ -133,9 +122,9 @@ function TickerRow({ sym, onClick, earningsMap, straddleMap }) {
         </div>
         <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2 }}>{subLabel}</div>
         <div style={{ marginTop: 6, width: 90 }}>
-          <MiniBar pct={pct_a}  sig={sig_a}  label="A" />
-          <MiniBar pct={pct_b}  sig={sig_b}  label="B" />
-          <MiniBar pct={pct_ep} sig={sig_ep} label="EP" />
+          <MiniBar pct={t.pct_a}  sig={t.sig_a}  label="A" />
+          <MiniBar pct={t.pct_b}  sig={t.sig_b}  label="B" />
+          <MiniBar pct={t.pct_ep} sig={t.sig_ep} label="EP" />
         </div>
       </div>
       <div style={{ textAlign: "right", fontSize: 13, fontWeight: 500, color: "var(--text)" }}>{t.price}</div>
@@ -156,25 +145,43 @@ function TickerRow({ sym, onClick, earningsMap, straddleMap }) {
   );
 }
 
-export default function WatchlistScreen({ onSelectTicker, onTab, earningsMap, straddleMap }) {
-  const [searchQuery, setSearchQuery] = useState("");
-  const [parquetSyms, setParquetSyms] = useState([]);
+function Spinner() {
+  return (
+    <>
+      <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
+      `}</style>
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", flex: 1, gap: 12 }}>
+        <div style={{
+          width: 24, height: 24, borderRadius: "50%",
+          border: "2px solid var(--border)",
+          borderTopColor: "var(--blue)",
+          animation: "spin 0.75s linear infinite"
+        }} />
+        <div style={{ fontSize: 12, color: "var(--text3)" }}>Loading tickers…</div>
+      </div>
+    </>
+  );
+}
 
-  // Load full ticker list from parquet data once on mount
+export default function WatchlistScreen({ onSelectTicker, onTab, earningsMap }) {
+  const [searchQuery, setSearchQuery] = useState("");
+  const [allSyms, setAllSyms] = useState([]);
+  const [loading, setLoading] = useState(true);
+
   useEffect(() => {
     fetch(`${API_BASE}/analysis?dbe=0`)
       .then(r => r.json())
-      .then(d => setParquetSyms((d.tickers || []).map(t => t.ticker)))
-      .catch(() => {});
+      .then(d => {
+        setAllSyms((d.tickers || []).map(t => t.ticker));
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
   }, []);
-
-  // Merge: known mock tickers first, then any additional parquet-only tickers
-  const knownSyms = Object.keys(tickers);
-  const allSyms = [...new Set([...knownSyms, ...parquetSyms])];
 
   const query = searchQuery.trim().toUpperCase();
   const searchResults = query
-    ? allSyms.filter(sym => sym.includes(query) || (tickers[sym]?.name ?? "").toLowerCase().includes(query.toLowerCase()))
+    ? allSyms.filter(sym => sym.includes(query))
     : null;
 
   const thisWeek = [], nextWeek = [], upcoming = [], noDate = [];
@@ -190,11 +197,11 @@ export default function WatchlistScreen({ onSelectTicker, onTab, earningsMap, st
     if (!earnInfo) { noDate.push({ sym, date: null }); return; }
     const earnDate = new Date(earnInfo.date + "T00:00:00");
     const days = tradingDaysCount(earnInfo.date, earnInfo.time);
-    if (days !== null && days < 0)               noDate.push({ sym, date: earnDate });
-    else if (earnDate >= monday && earnDate <= friday)         thisWeek.push({ sym, date: earnDate, days });
-    else if (earnDate >= nextMonday && earnDate <= nextFriday) nextWeek.push({ sym, date: earnDate, days });
-    else if (earnDate > nextFriday)              upcoming.push({ sym, date: earnDate, days });
-    else                                         noDate.push({ sym, date: null });
+    if (days !== null && days < 0)                               noDate.push({ sym, date: earnDate });
+    else if (earnDate >= monday && earnDate <= friday)           thisWeek.push({ sym, date: earnDate, days });
+    else if (earnDate >= nextMonday && earnDate <= nextFriday)   nextWeek.push({ sym, date: earnDate, days });
+    else if (earnDate > nextFriday)                              upcoming.push({ sym, date: earnDate, days });
+    else                                                         noDate.push({ sym, date: null });
   });
 
   thisWeek.sort((a, b) => a.date - b.date);
@@ -235,16 +242,18 @@ export default function WatchlistScreen({ onSelectTicker, onTab, earningsMap, st
         </div>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 70px 64px 80px", padding: "8px 16px 6px", gap: 6, flexShrink: 0 }}>
-        {["Ticker / Percentiles", "Price", "Chg", "Straddle"].map((h, i) => (
-          <span key={h} style={{ fontSize: 10, color: "var(--text4)", textTransform: "uppercase", letterSpacing: "0.04em", textAlign: i > 0 ? "right" : "left" }}>
-            {h}
-          </span>
-        ))}
-      </div>
+      {!loading && (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 70px 64px 80px", padding: "8px 16px 6px", gap: 6, flexShrink: 0 }}>
+          {["Ticker / Percentiles", "Price", "Chg", "Straddle"].map((h, i) => (
+            <span key={h} style={{ fontSize: 10, color: "var(--text4)", textTransform: "uppercase", letterSpacing: "0.04em", textAlign: i > 0 ? "right" : "left" }}>
+              {h}
+            </span>
+          ))}
+        </div>
+      )}
 
-      <div style={{ flex: 1, overflowY: "auto" }}>
-        {searchResults ? (
+      <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column" }}>
+        {loading ? <Spinner /> : searchResults ? (
           searchResults.length === 0 ? (
             <div style={{ padding: "40px 20px", textAlign: "center", color: "var(--text3)", fontSize: 13 }}>
               No results for "{searchQuery}"
@@ -253,7 +262,7 @@ export default function WatchlistScreen({ onSelectTicker, onTab, earningsMap, st
             <>
               <SectionHeader label={`${searchResults.length} result${searchResults.length !== 1 ? "s" : ""}`} />
               {searchResults.map(sym => (
-                <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} straddleMap={straddleMap} />
+                <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} />
               ))}
             </>
           )
@@ -261,19 +270,19 @@ export default function WatchlistScreen({ onSelectTicker, onTab, earningsMap, st
           <>
             {thisWeek.length > 0 && (<>
               <SectionHeader label="Earnings This Week" />
-              {thisWeek.map(({ sym }) => <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} straddleMap={straddleMap} />)}
+              {thisWeek.map(({ sym }) => <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} />)}
             </>)}
             {nextWeek.length > 0 && (<>
               <SectionHeader label="Earnings Next Week" />
-              {nextWeek.map(({ sym }) => <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} straddleMap={straddleMap} />)}
+              {nextWeek.map(({ sym }) => <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} />)}
             </>)}
             {upcoming.length > 0 && (<>
               <SectionHeader label="Upcoming Earnings" />
-              {upcoming.map(({ sym }) => <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} straddleMap={straddleMap} />)}
+              {upcoming.map(({ sym }) => <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} />)}
             </>)}
             {noDate.length > 0 && (<>
               <SectionHeader label="Date Not Confirmed" />
-              {noDate.map(({ sym }) => <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} straddleMap={straddleMap} />)}
+              {noDate.map(({ sym }) => <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} />)}
             </>)}
           </>
         )}
