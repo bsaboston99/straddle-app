@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { API_BASE } from "../data/tickers";
 import TabBar from "./TabBar";
 import AnalysisDetailScreen from "./AnalysisDetailScreen";
+import { IconSearch } from "./Icons";
 
 const DBE_OPTIONS = [0, 1, 2, 3, 4, 5];
 
@@ -105,7 +106,7 @@ export default function AnalysisScreen({ onTab }) {
 
         {/* Search */}
         <div style={{ display: "flex", alignItems: "center", gap: 8, background: "var(--surface)", borderRadius: 8, padding: "8px 12px" }}>
-          <span style={{ color: "var(--text4)", fontSize: 14 }}>🔍</span>
+          <IconSearch size={15} color="var(--text4)" />
           <input
             type="text"
             value={search}

@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import TabBar from "./TabBar";
 import { API_BASE } from "../data/tickers";
+import { IconInfo } from "./Icons";
 
 const VAPID_PUBLIC_KEY = import.meta.env.VITE_VAPID_PUBLIC_KEY || "";
 
@@ -252,7 +253,7 @@ export default function SettingsScreen({ onTab, isDark, setIsDark }) {
           background: "var(--surface)", borderRadius: 12,
           display: "flex", gap: 10, alignItems: "flex-start"
         }}>
-          <span style={{ fontSize: 16, flexShrink: 0 }}>ℹ️</span>
+          <IconInfo size={16} color="var(--text3)" />
           <div style={{ fontSize: 12, color: "var(--text3)", lineHeight: 1.55 }}>
             Alerts notify you when any watchlist ticker's earnings premium percentile drops below your threshold. Checks run daily. Requires Insignia to be added to your home screen.
           </div>

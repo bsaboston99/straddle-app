@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { API_BASE } from "../data/tickers";
 import { MiniBar } from "./MiniBar";
 import TabBar from "./TabBar";
+import { IconSearch, IconBell } from "./Icons";
 
 // Deterministic seeded random — same ticker always gets the same dummy values
 function seededRand(seed, offset = 0) {
@@ -220,12 +221,12 @@ export default function WatchlistScreen({ onSelectTicker, onTab, earningsMap }) 
       <div style={{ padding: "18px 20px 12px", borderBottom: "0.5px solid var(--border)", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
           <h1 style={{ fontSize: 20, fontWeight: 500, margin: 0, color: "var(--text)" }}>Watchlist</h1>
-          <div style={{ display: "flex", gap: 16, fontSize: 20, color: "var(--text4)" }}>
-            <span>🔔</span><span>🔍</span>
+          <div style={{ display: "flex", gap: 16, color: "var(--text4)" }}>
+            <IconBell size={20} /><IconSearch size={20} />
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8, background: "var(--surface)", borderRadius: 8, padding: "8px 12px" }}>
-          <span style={{ color: "var(--text4)", fontSize: 14 }}>🔍</span>
+          <IconSearch size={15} color="var(--text4)" />
           <input
             type="text"
             value={searchQuery}
