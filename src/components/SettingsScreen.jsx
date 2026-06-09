@@ -1,5 +1,25 @@
 import { useState, useEffect } from "react";
 import TabBar from "./TabBar";
+import { API_BASE } from "../data/tickers";
+
+const VAPID_PUBLIC_KEY = import.meta.env.VITE_VAPID_PUBLIC_KEY || "";
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(base64);
+  return Uint8Array.from([...raw].map(c => c.charCodeAt(0)));
+}
+
+async function subscribeToPush() {
+  const reg = await navigator.serviceWorker.ready;
+  const existing = await reg.pushManager.getSubscription();
+  if (existing) return existing;
+  return reg.pushManager.subscribe({
+    userVisibleOnly: true,
+    applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+  });
+}
 
 function Toggle({ value, onChange }) {
   return (
@@ -41,6 +61,7 @@ export default function SettingsScreen({ onTab, isDark, setIsDark }) {
     try { return Number(localStorage.getItem("alerts_threshold") || "25"); }
     catch { return 25; }
   });
+  const [pushStatus, setPushStatus] = useState("idle"); // idle | requesting | granted | denied | error
 
   useEffect(() => {
     try { localStorage.setItem("alerts_enabled", String(alertsEnabled)); } catch {}
@@ -48,7 +69,71 @@ export default function SettingsScreen({ onTab, isDark, setIsDark }) {
 
   useEffect(() => {
     try { localStorage.setItem("alerts_threshold", String(threshold)); } catch {}
+    // Sync threshold to backend whenever it changes and alerts are on
+    if (alertsEnabled) syncConfig(alertsEnabled, threshold);
   }, [threshold]);
+
+  function syncConfig(enabled, thresh) {
+    fetch(`${API_BASE}/alerts/config`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled, threshold: thresh }),
+    }).catch(() => {});
+  }
+
+  async function handleAlertsToggle(val) {
+    setAlertsEnabled(val);
+    syncConfig(val, threshold);
+
+    if (val) {
+      // Request push permission and subscribe
+      if (!("Notification" in window) || !("serviceWorker" in navigator)) {
+        setPushStatus("error");
+        return;
+      }
+      setPushStatus("requesting");
+      try {
+        const permission = await Notification.requestPermission();
+        if (permission !== "granted") {
+          setPushStatus("denied");
+          return;
+        }
+        const sub = await subscribeToPush();
+        await fetch(`${API_BASE}/push/subscribe`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ endpoint: sub.endpoint, keys: { p256dh: btoa(String.fromCharCode(...new Uint8Array(sub.getKey("p256dh")))), auth: btoa(String.fromCharCode(...new Uint8Array(sub.getKey("auth")))) } }),
+        });
+        setPushStatus("granted");
+      } catch (e) {
+        console.error("Push subscription error:", e);
+        setPushStatus("error");
+      }
+    } else {
+      // Unsubscribe
+      try {
+        const reg = await navigator.serviceWorker.ready;
+        const sub = await reg.pushManager.getSubscription();
+        if (sub) {
+          await fetch(`${API_BASE}/push/unsubscribe`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ endpoint: sub.endpoint, keys: {} }),
+          });
+          await sub.unsubscribe();
+        }
+      } catch {}
+      setPushStatus("idle");
+    }
+  }
+
+  const pushNote = {
+    idle: null,
+    requesting: "Requesting permission…",
+    granted: "Push notifications enabled ✓",
+    denied: "Notifications blocked. Enable in iOS Settings → Insignia → Notifications.",
+    error: "Push notifications not supported on this device/browser.",
+  }[pushStatus];
 
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, fontFamily: "system-ui, sans-serif", background: "var(--bg)", overflow: "hidden" }}>
@@ -87,13 +172,13 @@ export default function SettingsScreen({ onTab, isDark, setIsDark }) {
             <div>
               <div style={{ fontSize: 15, color: "var(--text)" }}>Enable Alerts</div>
               <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 2 }}>
-                {alertsEnabled ? "Alerts are active" : "Alerts are off"}
+                {alertsEnabled ? "Push notifications active" : "Alerts are off"}
               </div>
             </div>
-            <Toggle value={alertsEnabled} onChange={setAlertsEnabled} />
+            <Toggle value={alertsEnabled} onChange={handleAlertsToggle} />
           </div>
 
-          {/* Threshold slider — only shown when alerts are on */}
+          {/* Threshold slider */}
           {alertsEnabled && (
             <div style={{ padding: "14px 16px" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10 }}>
@@ -116,6 +201,16 @@ export default function SettingsScreen({ onTab, isDark, setIsDark }) {
               <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 10, lineHeight: 1.5 }}>
                 You'll be notified when any watchlist ticker's earnings premium drops below the <strong style={{ color: "var(--text2)" }}>{threshold}th percentile</strong>.
               </div>
+
+              {/* Push status note */}
+              {pushNote && (
+                <div style={{
+                  marginTop: 10, fontSize: 12, lineHeight: 1.5,
+                  color: pushStatus === "granted" ? "var(--up)" : pushStatus === "denied" || pushStatus === "error" ? "var(--down)" : "var(--text3)"
+                }}>
+                  {pushNote}
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -129,7 +224,7 @@ export default function SettingsScreen({ onTab, isDark, setIsDark }) {
         }}>
           <span style={{ fontSize: 16, flexShrink: 0 }}>ℹ️</span>
           <div style={{ fontSize: 12, color: "var(--text3)", lineHeight: 1.55 }}>
-            Alerts will notify you when any watchlist ticker's earnings premium percentile crosses below your threshold — a signal that the market is pricing in a relatively cheap earnings move. Push notification delivery coming soon.
+            Alerts notify you when any watchlist ticker's earnings premium percentile drops below your threshold. Checks run daily. Requires Insignia to be added to your home screen.
           </div>
         </div>
 

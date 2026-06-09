@@ -4,9 +4,11 @@ __pycache__/
 *.pyo
 .env
 
-# Runtime caches (written at runtime, not committed)
+# Runtime caches and push data (written at runtime, not committed)
 backend-api/earnings_cache.json
 backend-api/df_cache.feather
+backend-api/push_subscriptions.json
+backend-api/alerts_config.json
 
 # Logs
 logs

@@ -1,8 +1,10 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import requests
 import pandas as pd
 import os
+import json
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -475,3 +477,130 @@ def debug_nasdaq(date_str: str):
         return r.json()
     except Exception as e:
         return {"error": str(e)}
+
+
+# ── Push Notifications ────────────────────────────────────────────────────────
+
+VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "")
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
+VAPID_CLAIMS      = {"sub": "mailto:bsandersonn99@gmail.com"}
+
+SUBSCRIPTIONS_FILE = Path(__file__).parent / "push_subscriptions.json"
+ALERTS_CONFIG_FILE = Path(__file__).parent / "alerts_config.json"
+
+WATCHLIST = ["NVDA", "ORCL", "ADBE", "TSLA", "AMZN", "META", "SPY"]
+
+
+def load_subscriptions() -> list:
+    try:
+        if SUBSCRIPTIONS_FILE.exists():
+            return json.loads(SUBSCRIPTIONS_FILE.read_text())
+    except Exception:
+        pass
+    return []
+
+def save_subscriptions(subs: list):
+    SUBSCRIPTIONS_FILE.write_text(json.dumps(subs))
+
+def load_alerts_config() -> dict:
+    try:
+        if ALERTS_CONFIG_FILE.exists():
+            return json.loads(ALERTS_CONFIG_FILE.read_text())
+    except Exception:
+        pass
+    return {"enabled": False, "threshold": 25}
+
+def save_alerts_config(config: dict):
+    ALERTS_CONFIG_FILE.write_text(json.dumps(config))
+
+
+class PushSubscription(BaseModel):
+    endpoint: str
+    keys: dict
+
+class AlertsConfig(BaseModel):
+    enabled: bool
+    threshold: int
+
+
+@app.post("/push/subscribe")
+def subscribe(sub: PushSubscription):
+    subs = load_subscriptions()
+    # Avoid duplicate endpoints
+    subs = [s for s in subs if s.get("endpoint") != sub.endpoint]
+    subs.append({"endpoint": sub.endpoint, "keys": sub.keys})
+    save_subscriptions(subs)
+    return {"status": "subscribed"}
+
+@app.post("/push/unsubscribe")
+def unsubscribe(sub: PushSubscription):
+    subs = load_subscriptions()
+    subs = [s for s in subs if s.get("endpoint") != sub.endpoint]
+    save_subscriptions(subs)
+    return {"status": "unsubscribed"}
+
+@app.post("/alerts/config")
+def set_alerts_config(config: AlertsConfig):
+    save_alerts_config({"enabled": config.enabled, "threshold": config.threshold})
+    return {"status": "saved"}
+
+@app.get("/alerts/config")
+def get_alerts_config():
+    return load_alerts_config()
+
+
+def send_push(subscription: dict, title: str, body: str):
+    """Send a single Web Push notification."""
+    try:
+        from pywebpush import webpush, WebPushException
+        webpush(
+            subscription_info=subscription,
+            data=json.dumps({"title": title, "body": body}),
+            vapid_private_key=VAPID_PRIVATE_KEY,
+            vapid_claims=VAPID_CLAIMS,
+        )
+    except Exception as e:
+        print(f"Push send error: {e}")
+
+
+@app.post("/alerts/trigger")
+def trigger_alerts():
+    """Check watchlist straddle percentiles against threshold and push alerts."""
+    if df_global is None:
+        return {"status": "no data"}
+
+    config = load_alerts_config()
+    if not config.get("enabled"):
+        return {"status": "alerts disabled"}
+
+    threshold = config.get("threshold", 25)
+    subs = load_subscriptions()
+    if not subs:
+        return {"status": "no subscribers"}
+
+    triggered = []
+    for sym in WATCHLIST:
+        try:
+            live = MOCK_LIVE.get(sym)
+            if live:
+                result = get_straddle_percentile_live(
+                    df_global, ticker=sym, dbe=0,
+                    live_close_a=live["close_a"], live_close_b=live["close_b"],
+                    live_spy_close_a=live["spy_close_a"], live_spy_close_b=live["spy_close_b"],
+                )
+            else:
+                result = get_straddle_percentile(df_global, ticker=sym, dbe=0)
+
+            pct_a = result.get("pct_a", 100)
+            if pct_a <= threshold:
+                triggered.append({"ticker": sym, "pct_a": pct_a})
+                for sub in subs:
+                    send_push(
+                        sub,
+                        title=f"Insignia Alert — {sym}",
+                        body=f"Straddle A at {pct_a}th percentile (below your {threshold}th threshold)"
+                    )
+        except Exception as e:
+            print(f"Alert check error for {sym}: {e}")
+
+    return {"status": "done", "triggered": triggered, "threshold": threshold}

@@ -4,3 +4,4 @@ pandas
 pyarrow
 scipy
 requests
+pywebpush
