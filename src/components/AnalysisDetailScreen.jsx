@@ -263,7 +263,7 @@ export default function AnalysisDetailScreen({ ticker, onBack, onTab }) {
     <div style={{ display: "flex", flexDirection: "column", flex: 1, fontFamily: "system-ui, sans-serif", background: "var(--bg)", overflow: "hidden" }}>
 
       {/* Header */}
-      <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "16px 20px 14px", borderBottom: "0.5px solid var(--border)", flexShrink: 0 }}>
+      <div className="safe-top" style={{ display: "flex", alignItems: "center", gap: 12, padding: "16px 20px 14px", borderBottom: "0.5px solid var(--border)", flexShrink: 0 }}>
         <button onClick={onBack} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 22, color: "var(--text2)", padding: 0 }}>
           &#8592;
         </button>

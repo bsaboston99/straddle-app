@@ -88,7 +88,7 @@ export default function EarningsScreen({ onTab }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, fontFamily: "system-ui, sans-serif", background: "var(--bg)", overflow: "hidden" }}>
 
-      <div style={{ padding: "18px 20px 12px", borderBottom: "0.5px solid var(--border)", flexShrink: 0 }}>
+      <div className="safe-top" style={{ padding: "18px 20px 12px", borderBottom: "0.5px solid var(--border)", flexShrink: 0 }}>
         <h1 style={{ fontSize: 20, fontWeight: 500, margin: "0 0 14px", color: "var(--text)" }}>Earnings Calendar</h1>
         <div style={{ display: "flex", gap: 8 }}>
           {FILTERS.map(f => (
