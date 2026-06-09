@@ -25,7 +25,7 @@ export default function App() {
   }, [isDark]);
 
   useEffect(() => {
-    fetch(`${API_BASE}/earnings?universe=all&weeks=12`)
+    fetch(`${API_BASE}/earnings?universe=all&weeks=8`)
       .then(r => r.json())
       .then(d => {
         const map = {};

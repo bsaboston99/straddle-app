@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import requests
 import pandas as pd
 import os
+import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from straddle_analysis import load_all_data, add_relative_straddles, get_straddle_percentile, get_straddle_percentile_live
@@ -34,17 +36,63 @@ MOCK_LIVE = {
 
 df_global = None
 
+FEATHER_CACHE = Path(__file__).parent / "df_cache.feather"
+
+def _get_parquet_mtime() -> float:
+    """Return the newest mtime across all parquet files in COMBINED_DIR."""
+    try:
+        mtimes = [p.stat().st_mtime for p in COMBINED_DIR.glob("*.parquet")]
+        return max(mtimes) if mtimes else 0.0
+    except Exception:
+        return 0.0
+
+def _load_df() -> "pd.DataFrame | None":
+    """Load processed DataFrame from feather cache if fresh, else rebuild from parquet."""
+    # Check if feather cache exists and is newer than all source parquet files
+    if FEATHER_CACHE.exists():
+        try:
+            cache_mtime = FEATHER_CACHE.stat().st_mtime
+            if cache_mtime >= _get_parquet_mtime():
+                print("Loading DataFrame from feather cache...")
+                df = pd.read_feather(FEATHER_CACHE)
+                print(f"Feather cache loaded. {len(df):,} rows.")
+                return df
+            else:
+                print("Parquet files newer than cache — rebuilding.")
+        except Exception as e:
+            print(f"Feather cache read error: {e} — rebuilding.")
+
+    # Build from source parquet files
+    print("Loading parquet files...")
+    df = load_all_data(COMBINED_DIR)
+    df = add_relative_straddles(df)
+    print(f"Parquet loaded. {len(df):,} rows. Saving feather cache...")
+
+    try:
+        df.reset_index(drop=True).to_feather(FEATHER_CACHE)
+        print("Feather cache saved.")
+    except Exception as e:
+        print(f"Feather cache write error (non-fatal): {e}")
+
+    return df
+
 @app.on_event("startup")
 async def startup_event():
     global df_global
-    print("Loading parquet files...")
     try:
-        df_global = load_all_data(COMBINED_DIR)
-        df_global = add_relative_straddles(df_global)
-        print(f"Parquet files loaded successfully. {len(df_global):,} rows.")
+        df_global = _load_df()
     except Exception as e:
-        print(f"WARNING: Could not load parquet files: {e}")
+        print(f"WARNING: Could not load data: {e}")
         df_global = None
+
+    # Pre-warm earnings cache in background so first user doesn't wait
+    asyncio.create_task(_prewarm_earnings())
+
+async def _prewarm_earnings():
+    await asyncio.sleep(3)  # let server finish starting
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, lambda: get_earnings(universe="all", weeks=8))
+    print("Earnings pre-warm complete.")
 
 SP500 = [
     "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","BRK-B","JPM","UNH",
@@ -69,6 +117,35 @@ HIGH_VOL_OPTIONS = [
 cache = {}
 CACHE_TTL_HOURS = 6
 
+# Disk-based earnings cache — survives process restarts within the same day
+EARNINGS_DISK_CACHE = Path(__file__).parent / "earnings_cache.json"
+
+def load_earnings_from_disk() -> dict | None:
+    """Return today's cached earnings from disk, or None if stale/missing."""
+    try:
+        import json
+        if not EARNINGS_DISK_CACHE.exists():
+            return None
+        with open(EARNINGS_DISK_CACHE) as f:
+            stored = json.load(f)
+        if stored.get("date") == str(datetime.today().date()):
+            print("Loaded earnings from disk cache.")
+            return stored.get("data")
+    except Exception as e:
+        print(f"Disk cache read error: {e}")
+    return None
+
+def save_earnings_to_disk(data: dict):
+    """Write earnings data to disk with today's date stamp."""
+    try:
+        import json
+        payload = {"date": str(datetime.today().date()), "data": data}
+        with open(EARNINGS_DISK_CACHE, "w") as f:
+            json.dump(payload, f)
+        print("Earnings saved to disk cache.")
+    except Exception as e:
+        print(f"Disk cache write error: {e}")
+
 def is_cache_valid(key: str) -> bool:
     if key not in cache:
         return False
@@ -87,7 +164,14 @@ def get_universe(name: str) -> list:
 
 def fetch_nasdaq_earnings(date_str: str) -> list:
     url = f"https://api.nasdaq.com/api/calendar/earnings?date={date_str}"
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Origin": "https://www.nasdaq.com",
+        "Referer": "https://www.nasdaq.com/market-activity/earnings",
+    }
     try:
         r = requests.get(url, headers=headers, timeout=10)
         data = r.json()
@@ -121,27 +205,49 @@ def root():
 @app.get("/earnings")
 def get_earnings(universe: str = "all", weeks: int = 4):
     cache_key = f"earnings_{universe}_{weeks}"
+
+    # 1. In-memory cache (fastest)
     if is_cache_valid(cache_key):
         return cache[cache_key]["data"]
 
+    # 2. Disk cache — valid if it was written today
+    disk_data = load_earnings_from_disk()
+    if disk_data is not None:
+        cache[cache_key] = {"data": disk_data, "timestamp": datetime.now()}
+        return disk_data
+
+    # 3. Fetch from NASDAQ (once per day)
     universe_tickers = set(get_universe(universe))
     today = datetime.today().date()
-    grouped = {}
-    total = 0
 
-    for i in range(weeks * 7):
-        date = today + timedelta(days=i)
-        if date.weekday() >= 5:
-            continue
-        date_str = str(date)
-        rows = fetch_nasdaq_earnings(date_str)
-        filtered = [r for r in rows if r["ticker"] in universe_tickers]
+    trading_days = [
+        str(today + timedelta(days=i))
+        for i in range(weeks * 7)
+        if (today + timedelta(days=i)).weekday() < 5
+    ]
+
+    raw: dict[str, list] = {}
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_date = {executor.submit(fetch_nasdaq_earnings, d): d for d in trading_days}
+        for future in as_completed(future_to_date):
+            date_str = future_to_date[future]
+            try:
+                raw[date_str] = future.result()
+            except Exception:
+                raw[date_str] = []
+
+    grouped = {}
+    for date_str in sorted(raw):
+        filtered = [r for r in raw[date_str] if r["ticker"] in universe_tickers]
         if filtered:
             grouped[date_str] = filtered
-            total += len(filtered)
 
+    total = sum(len(v) for v in grouped.values())
     response = {"grouped": grouped, "total": total, "universe": universe}
+
+    # Save to both memory and disk
     cache[cache_key] = {"data": response, "timestamp": datetime.now()}
+    save_earnings_to_disk(response)
     return response
 
 @app.get("/straddle/{ticker}")
