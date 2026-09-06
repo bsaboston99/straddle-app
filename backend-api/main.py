@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from straddle_analysis import load_all_data, add_relative_straddles, get_straddle_percentile, get_straddle_percentile_live
+import paper_trading
 
 app = FastAPI()
 
@@ -86,6 +87,11 @@ async def startup_event():
     except Exception as e:
         print(f"WARNING: Could not load data: {e}")
         df_global = None
+
+    try:
+        paper_trading.init_db()
+    except Exception as e:
+        print(f"WARNING: Could not init paper trading db: {e}")
 
     # Pre-warm earnings cache in background so first user doesn't wait
     asyncio.create_task(_prewarm_earnings())
@@ -617,3 +623,57 @@ def trigger_alerts():
             print(f"Alert check error for {sym}: {e}")
 
     return {"status": "done", "triggered": triggered, "threshold": threshold}
+
+# ---------------------------------------------------------------------------
+# Paper trading — results tab + daily signal/execution cron target
+# ---------------------------------------------------------------------------
+
+@app.get("/paper-trading/summary")
+def paper_trading_summary():
+    try:
+        return paper_trading.get_performance_summary()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/paper-trading/trades")
+def paper_trading_trades():
+    try:
+        return {"trades": paper_trading.get_all_trades()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/paper-trading/positions")
+def paper_trading_positions():
+    try:
+        return {"positions": paper_trading.get_open_positions()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/paper-trading/signals")
+def paper_trading_signals(limit: int = 200):
+    try:
+        return {"signals": paper_trading.get_recent_signals(limit=limit)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/paper-trading/run-daily-check")
+def paper_trading_run_daily_check():
+    """Called once a day by the insignia-paper-trading cron entry in
+    render.yaml (same pattern as /alerts/trigger). Reuses the same NASDAQ
+    earnings calendar the Earnings tab already shows, so there's a single
+    source of truth for "what's coming up" across the whole app.
+    """
+    try:
+        earnings_resp = get_earnings(universe="all", weeks=3)
+        upcoming = {}
+        for items in earnings_resp["grouped"].values():
+            for item in items:
+                upcoming[item["ticker"]] = {"date": item["date"], "time": item.get("time", "TBD")}
+        results = paper_trading.run_daily_check(upcoming)
+        return {"status": "done", **results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

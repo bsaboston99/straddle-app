@@ -1,9 +1,10 @@
-import { IconList, IconBarChart, IconCalendar, IconSettings } from "./Icons";
+import { IconList, IconBarChart, IconCalendar, IconTrendingUp, IconSettings } from "./Icons";
 
 const TABS = [
   { label: "Watchlist", Icon: IconList },
   { label: "Analysis",  Icon: IconBarChart },
   { label: "Earnings",  Icon: IconCalendar },
+  { label: "Trading", Icon: IconTrendingUp },
   { label: "Settings",  Icon: IconSettings },
 ];
 

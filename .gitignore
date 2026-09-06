@@ -34,3 +34,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Paper trading runtime database (dev-machine test data, not part of the deploy state)
+backend-api/data/paper_trading.db

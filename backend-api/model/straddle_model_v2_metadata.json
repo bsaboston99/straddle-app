@@ -1,0 +1,40 @@
+{
+  "trained_on_rows": 10143,
+  "trained_on_cycles": 1259,
+  "total_cycles_seen": 1664,
+  "er_date_range": [
+    "2023-01-13",
+    "2025-11-25"
+  ],
+  "feature_names": [
+    "dbe",
+    "calldte_a",
+    "calldte_b",
+    "closestraddle_a",
+    "closestraddle_b",
+    "rel_straddle_a",
+    "rel_straddle_b",
+    "chg_straddle_a",
+    "chg_straddle_b",
+    "callclose_a",
+    "putclose_a",
+    "callclose_b",
+    "putclose_b",
+    "callvolume_a",
+    "calltrans_a",
+    "putvolume_a",
+    "puttrans_a",
+    "stock_close",
+    "stock_volume",
+    "stockchg",
+    "spy_close",
+    "spychg",
+    "closespystraddle_a",
+    "chg_spystraddle_a",
+    "days_ahead",
+    "exit_dbe"
+  ],
+  "target": "log_ratio = log(exit_rel_straddle_a / entry_rel_straddle_a)",
+  "zero_dte_rows_excluded": true,
+  "note": "Trained on 100% of available history for production use -- this is not a new validation. Out-of-sample performance (walk-forward R^2 beating naive baseline on every fold) is documented in _claude_ml_v2_summary.json and ml_model_v2_documentation.md. This should reproduce the same total_training_pairs count as _claude_ml_v2_summary.json's total_training_pairs (10,143) -- if it doesn't match closely, something is still off."
+}

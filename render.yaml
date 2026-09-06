@@ -13,6 +13,12 @@ services:
         sync: false
       - key: VAPID_PRIVATE_KEY
         sync: false
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_SECRET_KEY
+        sync: false
+      - key: ALPACA_BASE_URL
+        value: https://paper-api.alpaca.markets
 
   # ── React / Vite frontend ─────────────────────────────────────────────────
   - type: web
@@ -38,3 +44,17 @@ services:
     buildCommand: pip install requests
     schedule: "0 14 * * 1-5"  # 9am ET Mon–Fri (UTC-5)
     startCommand: python -c "import requests; requests.post('https://insignia-api-qkex.onrender.com/alerts/trigger')"
+
+  # ── Daily paper-trading signal check + entry/exit execution ────────────────
+  # Same pattern as insignia-alerts above. Runs once a day, near the close,
+  # since this strategy trades on daily closes rather than intraday moves.
+  # NOTE: fixed UTC offset like the alerts cron above -- doesn't auto-adjust
+  # for daylight saving. 20:45 UTC = 3:45pm ET during EDT (most of the year);
+  # during EST (~Nov-Mar) that becomes 2:45pm ET. Adjust if that drift matters.
+  - type: cron
+    name: insignia-paper-trading
+    runtime: python
+    rootDir: backend-api
+    buildCommand: pip install requests
+    schedule: "45 20 * * 1-5"
+    startCommand: python -c "import requests; requests.post('https://insignia-api-qkex.onrender.com/paper-trading/run-daily-check')"

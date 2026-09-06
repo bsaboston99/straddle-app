@@ -5,3 +5,7 @@ pyarrow
 scipy
 requests
 pywebpush
+scikit-learn
+joblib
+alpaca-py
+python-dotenv

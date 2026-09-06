@@ -63,6 +63,15 @@ export function IconCalendar({ size = 20, color = "currentColor", strokeWidth = 
   );
 }
 
+export function IconTrendingUp({ size = 20, color = "currentColor", strokeWidth = 1.75 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" stroke={color} strokeWidth={strokeWidth} {...base}>
+      <polyline points="3 17 9 11 13 15 21 6" />
+      <polyline points="14 6 21 6 21 13" />
+    </svg>
+  );
+}
+
 export function IconSettings({ size = 20, color = "currentColor", strokeWidth = 1.75 }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" stroke={color} strokeWidth={strokeWidth} {...base}>

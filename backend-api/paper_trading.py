@@ -1,0 +1,609 @@
+"""
+Paper trading engine for the earnings-straddle strategy.
+
+Scope and honesty check up front: the ledger, rule logic, and position sizing
+here follow exactly what was calibrated and agreed on earlier (entry when
+dbe is 2 or 3 and the model's predicted_log_ratio >= 0.3, exit at dbe == 0,
+10% of current equity per trade, no hard concurrency cap -- just skip a
+signal if there isn't enough buying power). That part is solid.
+
+The Alpaca option-contract-lookup and multi-leg order submission calls below
+are written against alpaca-py's documented API shape, but have NOT been run
+against a live account -- there were no credentials available to test with.
+Treat those specific calls (find_atm_contract, place_straddle_entry,
+close_straddle) as a first draft: run _claude_alpaca_connection_test.py
+first, then dry-run run_daily_check() against a quiet day before trusting it
+with real (paper) order flow, and expect to adjust call shapes if alpaca-py
+has moved since this was written.
+
+Storage: SQLite via stdlib sqlite3, in a single file (paper_trading.db).
+This is fine for local development, but Render's default web service disk is
+EPHEMERAL -- a redeploy or restart can wipe it. Before relying on this in
+production, either attach a Render persistent disk and point DB_PATH at it,
+or migrate this module to a real Postgres connection (Render has a managed
+tier). The schema is simple enough that porting it later is not a rewrite.
+"""
+import os
+import sqlite3
+import json
+from datetime import datetime, date, timedelta
+from pathlib import Path
+from contextlib import contextmanager
+
+from dotenv import load_dotenv
+load_dotenv()  # loads backend-api/.env into the process environment -- this
+                # needs to happen HERE (not just in standalone test scripts)
+                # so it's picked up no matter what imports this module,
+                # including uvicorn running main.py.
+
+import joblib
+import numpy as np
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+ENTRY_DBE_MIN, ENTRY_DBE_MAX = 2, 3
+THRESHOLD = 0.3
+POSITION_FRACTION = 0.10  # 10% of current equity per trade
+
+DB_PATH = Path(os.environ.get("PAPER_TRADING_DB", Path(__file__).parent / "data" / "paper_trading.db"))
+MODEL_PATH = Path(os.environ.get("MODEL_PATH", Path(__file__).parent / "model" / "straddle_model_v2.joblib"))
+
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
+ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+
+if "paper-api" not in ALPACA_BASE_URL:
+    raise RuntimeError(
+        f"ALPACA_BASE_URL='{ALPACA_BASE_URL}' does not look like the paper "
+        "trading endpoint. Refusing to start -- this module is paper-trading "
+        "only. If you've deliberately moved to live trading, that decision "
+        "needs to be made explicitly elsewhere, not silently allowed here."
+    )
+
+_model_bundle = None
+_trading_client = None
+_option_data_client = None
+
+
+def get_model():
+    global _model_bundle
+    if _model_bundle is None:
+        if not MODEL_PATH.exists():
+            raise RuntimeError(
+                f"Model file not found at {MODEL_PATH}. Run _claude_ml_v2_persist.py "
+                "and copy straddle_model_v2.joblib + straddle_model_v2_metadata.json here."
+            )
+        _model_bundle = joblib.load(MODEL_PATH)
+    return _model_bundle["model"], _model_bundle["feature_names"]
+
+
+def get_trading_client():
+    global _trading_client
+    if _trading_client is None:
+        from alpaca.trading.client import TradingClient
+        if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+            raise RuntimeError("ALPACA_API_KEY / ALPACA_SECRET_KEY not set.")
+        _trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+    return _trading_client
+
+
+def get_option_data_client():
+    global _option_data_client
+    if _option_data_client is None:
+        from alpaca.data.historical.option import OptionHistoricalDataClient
+        _option_data_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    return _option_data_client
+
+
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def get_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL,
+                er_date TEXT NOT NULL,
+                checked_at TEXT NOT NULL,
+                dbe INTEGER,
+                predicted_log_ratio REAL,
+                decision TEXT NOT NULL,       -- "entered" | "skipped_threshold" | "skipped_no_cash" | "skipped_dbe" | "error"
+                detail TEXT,
+                UNIQUE(ticker, er_date, checked_at)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL,
+                er_date TEXT NOT NULL,
+                entry_date TEXT NOT NULL,
+                exit_date TEXT,
+                call_symbol TEXT NOT NULL,
+                put_symbol TEXT NOT NULL,
+                predicted_log_ratio REAL,
+                position_size_usd REAL,
+                entry_cost REAL,
+                exit_value REAL,
+                pnl_usd REAL,
+                pnl_pct REAL,
+                status TEXT NOT NULL DEFAULT 'open',   -- "open" | "closed" | "expired_unfilled" | "error"
+                alpaca_entry_order_id TEXT,
+                alpaca_exit_order_id TEXT,
+                notes TEXT,
+                UNIQUE(ticker, er_date)
+            )
+        """)
+        conn.commit()
+
+
+def log_signal(ticker, er_date, dbe, predicted_log_ratio, decision, detail=""):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO signals (ticker, er_date, checked_at, dbe, predicted_log_ratio, decision, detail) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ticker, er_date, datetime.utcnow().isoformat(), dbe, predicted_log_ratio, decision, detail),
+        )
+
+
+def get_open_trade(ticker, er_date):
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM trades WHERE ticker = ? AND er_date = ? AND status = 'open'",
+            (ticker, er_date),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def record_trade_entry(ticker, er_date, call_symbol, put_symbol, predicted_log_ratio,
+                        position_size_usd, entry_cost, order_id, notes=""):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO trades (ticker, er_date, entry_date, call_symbol, put_symbol, "
+            "predicted_log_ratio, position_size_usd, entry_cost, status, alpaca_entry_order_id, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)",
+            (ticker, er_date, date.today().isoformat(), call_symbol, put_symbol,
+             predicted_log_ratio, position_size_usd, entry_cost, order_id, notes),
+        )
+
+
+def record_trade_exit(trade_id, exit_value, order_id, notes=""):
+    with get_db() as conn:
+        trade = conn.execute("SELECT * FROM trades WHERE id = ?", (trade_id,)).fetchone()
+        if trade is None:
+            return
+        entry_cost = trade["entry_cost"] or 0
+        pnl_usd = (exit_value - entry_cost) * (trade["position_size_usd"] / entry_cost) if entry_cost else None
+        pnl_pct = (exit_value - entry_cost) / entry_cost * 100 if entry_cost else None
+        conn.execute(
+            "UPDATE trades SET exit_date = ?, exit_value = ?, pnl_usd = ?, pnl_pct = ?, "
+            "status = 'closed', alpaca_exit_order_id = ?, notes = notes || ? WHERE id = ?",
+            (date.today().isoformat(), exit_value, pnl_usd, pnl_pct, order_id, ("; " + notes if notes else ""), trade_id),
+        )
+
+
+def get_all_trades():
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM trades ORDER BY entry_date DESC").fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_open_positions():
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM trades WHERE status = 'open' ORDER BY entry_date DESC").fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_recent_signals(limit=200):
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM signals ORDER BY checked_at DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_performance_summary():
+    trades = get_all_trades()
+    closed = [t for t in trades if t["status"] == "closed" and t["pnl_pct"] is not None]
+    return {
+        "total_trades": len(trades),
+        "open_positions": len([t for t in trades if t["status"] == "open"]),
+        "closed_trades": len(closed),
+        "win_rate_pct": round(sum(1 for t in closed if t["pnl_pct"] > 0) / len(closed) * 100, 1) if closed else None,
+        "avg_pnl_pct": round(sum(t["pnl_pct"] for t in closed) / len(closed), 1) if closed else None,
+        "total_pnl_usd": round(sum(t["pnl_usd"] for t in closed if t["pnl_usd"] is not None), 2) if closed else 0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# dbe computation (mirrors the frontend's tradingDaysUntil logic in
+# EarningsScreen.jsx, ported to Python so the server can decide on its own
+# without depending on the client)
+# ---------------------------------------------------------------------------
+
+def _is_weekend(d):
+    return d.weekday() >= 5  # Sat=5, Sun=6
+
+
+def compute_dbe(er_date_str, er_time, today=None):
+    """Trading days between today and the last day you could still act
+    before the print (mirrors EarningsScreen.jsx's tradingDaysUntil).
+    Does not account for market holidays -- same limitation as the existing
+    /alerts cron, which also uses a fixed calendar. Good enough for now,
+    worth revisiting if a holiday-heavy earnings week produces a wrong dbe.
+    """
+    today = today or date.today()
+    er_date = datetime.strptime(er_date_str, "%Y-%m-%d").date()
+    last_day_to_act = er_date
+    if er_time == "BMO":
+        last_day_to_act -= timedelta(days=1)
+        while _is_weekend(last_day_to_act):
+            last_day_to_act -= timedelta(days=1)
+
+    start_day = today
+    while _is_weekend(start_day):
+        start_day += timedelta(days=1)
+
+    if last_day_to_act < start_day:
+        return None  # already past the actionable window
+
+    count = 0
+    cursor = start_day
+    while cursor <= last_day_to_act:
+        if not _is_weekend(cursor):
+            count += 1
+        cursor += timedelta(days=1)
+
+    return max(count - 1, 0) if er_time == "BMO" else count
+
+
+# ---------------------------------------------------------------------------
+# Live feature computation (Alpaca market data)
+# ---------------------------------------------------------------------------
+
+def find_atm_option_pair(ticker, target_dte_days, as_of=None):
+    """Finds the closest-to-the-money call and put for `ticker`, on the
+    weekly expiration nearest `target_dte_days` out -- same idea as
+    combined_daily's daily ATM re-pick, just done live against Alpaca's
+    option contract list instead of a Massive/Polygon archive.
+
+    Returns (call_symbol, put_symbol, expiration_date, strike).
+    """
+    from alpaca.trading.requests import GetOptionContractsRequest
+    as_of = as_of or date.today()
+    target_exp = as_of + timedelta(days=target_dte_days)
+
+    client = get_trading_client()
+    stock_price = get_latest_stock_price(ticker)
+
+    # Paginate through ALL pages -- a chain as large as SPY's (many strikes x
+    # many expirations, including daily expirations) can span multiple pages
+    # of Alpaca's contract list. Without this, the call and put side of the
+    # correct expiration can land on different pages, making one side look
+    # "missing" when it actually isn't -- that's exactly what broke on the
+    # first dry run (AAPL's single-expiration weekly chain worked fine; SPY's
+    # much larger daily-expiration chain did not).
+    contracts = []
+    page_token = None
+    for _ in range(20):  # hard cap so a bug elsewhere can't loop forever
+        req = GetOptionContractsRequest(
+            underlying_symbols=[ticker],
+            expiration_date_gte=as_of.isoformat(),
+            expiration_date_lte=(target_exp + timedelta(days=4)).isoformat(),
+            strike_price_gte=str(round(stock_price * 0.9, 2)),
+            strike_price_lte=str(round(stock_price * 1.1, 2)),
+            status="active",
+            page_token=page_token,
+        )
+        resp = client.get_option_contracts(req)
+        contracts.extend(resp.option_contracts)
+        page_token = getattr(resp, "next_page_token", None)
+        if not page_token:
+            break
+
+    if not contracts:
+        raise RuntimeError(f"No option contracts found for {ticker} near {target_exp}")
+
+    # nearest expiration to target, then closest strike to spot, per side
+    exps = sorted({c.expiration_date for c in contracts})
+    best_exp = min(exps, key=lambda e: abs((e - target_exp).days))
+    same_exp = [c for c in contracts if c.expiration_date == best_exp]
+
+    calls = [c for c in same_exp if c.type == "call"]
+    puts = [c for c in same_exp if c.type == "put"]
+    if not calls or not puts:
+        raise RuntimeError(f"Missing call or put side for {ticker} at {best_exp}")
+
+    # Bracket the stock price rather than picking "closest to spot"
+    # independently per side. Verified against every real contract we've
+    # pulled from combined_daily (GME, NFLX, TWLO, MRNA, LLY, and ~15 others):
+    # the call strike is always exactly one increment ABOVE the put strike,
+    # never equal -- i.e. call = nearest listed strike >= spot, put = nearest
+    # listed strike <= spot. Picking "closest absolute distance" per side
+    # independently (the old logic) can accidentally converge on the SAME
+    # strike for both legs whenever spot sits closer to one strike than any
+    # other on both sides at once -- which is what happened with AAPL here --
+    # and more importantly doesn't match the convention the model was
+    # actually trained on for cases where it doesn't coincidentally converge.
+    calls_at_or_above = [c for c in calls if float(c.strike_price) >= stock_price]
+    best_call = min(calls_at_or_above, key=lambda c: float(c.strike_price)) if calls_at_or_above \
+        else max(calls, key=lambda c: float(c.strike_price))
+
+    puts_at_or_below = [c for c in puts if float(c.strike_price) <= stock_price]
+    best_put = max(puts_at_or_below, key=lambda c: float(c.strike_price)) if puts_at_or_below \
+        else min(puts, key=lambda c: float(c.strike_price))
+
+    return best_call.symbol, best_put.symbol, best_exp, float(best_call.strike_price)
+
+
+def get_latest_stock_price(ticker):
+    from alpaca.data.historical.stock import StockHistoricalDataClient
+    from alpaca.data.requests import StockLatestTradeRequest
+    client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    trade = client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=[ticker]))
+    return float(trade[ticker].price)
+
+
+def get_latest_option_quote_mid(symbol):
+    from alpaca.data.requests import OptionLatestQuoteRequest
+    client = get_option_data_client()
+    q = client.get_option_latest_quote(OptionLatestQuoteRequest(symbol_or_symbols=[symbol]))[symbol]
+    bid, ask = float(q.bid_price), float(q.ask_price)
+    if bid > 0 and ask > 0:
+        return (bid + ask) / 2
+    return ask or bid
+
+
+def compute_live_features(ticker, dbe):
+    """Builds the same feature vector the model was trained on, sourced
+    from Alpaca's live market data instead of the historical archive.
+    Some training features (callvolume_a, calltrans_a, putvolume_a,
+    puttrans_a and similar transaction-count fields) aren't cleanly
+    available from a live quote the same way -- left as NaN, which
+    HistGradientBoostingRegressor handles natively (see
+    ml_model_v2_documentation.md). This trades a small amount of feature
+    completeness for not blocking on data Alpaca's basic feed doesn't
+    expose; revisit if it turns out to matter.
+    """
+    call_sym, put_sym, exp_date, strike = find_atm_option_pair(ticker, target_dte_days=5)
+    spy_call_sym, spy_put_sym, spy_exp, _ = find_atm_option_pair(
+        "SPY", target_dte_days=(exp_date - date.today()).days
+    )
+
+    call_px = get_latest_option_quote_mid(call_sym)
+    put_px = get_latest_option_quote_mid(put_sym)
+    spy_call_px = get_latest_option_quote_mid(spy_call_sym)
+    spy_put_px = get_latest_option_quote_mid(spy_put_sym)
+
+    stock_close = get_latest_stock_price(ticker)
+    spy_close = get_latest_stock_price("SPY")
+
+    closestraddle_a = call_px + put_px
+    closespystraddle_a = spy_call_px + spy_put_px
+    rel_straddle_a = closestraddle_a / closespystraddle_a if closespystraddle_a else np.nan
+    calldte_a = (exp_date - date.today()).days
+
+    feat = {
+        "dbe": dbe,
+        "calldte_a": calldte_a,
+        "calldte_b": np.nan,          # back-month leg not computed live yet -- see note below
+        "closestraddle_a": closestraddle_a,
+        "closestraddle_b": np.nan,
+        "rel_straddle_a": rel_straddle_a,
+        "rel_straddle_b": np.nan,
+        "chg_straddle_a": np.nan,     # would need yesterday's live close cached; not tracked yet
+        "chg_straddle_b": np.nan,
+        "callclose_a": call_px,
+        "putclose_a": put_px,
+        "callclose_b": np.nan,
+        "putclose_b": np.nan,
+        "callvolume_a": np.nan,
+        "calltrans_a": np.nan,
+        "putvolume_a": np.nan,
+        "puttrans_a": np.nan,
+        "stock_close": stock_close,
+        "stock_volume": np.nan,
+        "stockchg": np.nan,
+        "spy_close": spy_close,
+        "spychg": np.nan,
+        "closespystraddle_a": closespystraddle_a,
+        "chg_spystraddle_a": np.nan,
+        "days_ahead": dbe,       # entry_dbe - exit_dbe(=0)
+        "exit_dbe": 0,
+    }
+    return feat, call_sym, put_sym, closestraddle_a
+
+# NOTE on the _b (back-month) and chg_* fields being NaN: the training set
+# uses them and they do carry some signal (chg_straddle_a/b show up in
+# feature importance, though well behind exit_dbe/days_ahead). Filling them
+# in live means also fetching the back-month contract pair and caching
+# yesterday's close per ticker so today's change can be computed. Left as a
+# follow-up rather than blocking this build -- the model handles missing
+# values, so this degrades gracefully rather than breaking, but it's worth
+# closing this gap before trusting live signals as much as the backtest.
+
+
+def mark_trade_unfilled_expired(trade_id, notes=""):
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE trades SET exit_date = ?, status = 'expired_unfilled', notes = notes || ? WHERE id = ?",
+            (date.today().isoformat(), ("; " + notes if notes else ""), trade_id),
+        )
+
+
+def has_open_position(symbol):
+    """True only if a REAL, filled position exists for this option symbol --
+    an accepted-but-unfilled order does not count. Learned the hard way: a
+    resting limit order (e.g. submitted while markets are closed, or an
+    illiquid strike that never traded at our price) can sit open indefinitely
+    with no position behind it. Attempting to "close" that with an opposite
+    order trips Alpaca's wash-trade protection (rejects with "potential wash
+    trade detected... opposite side market/stop order exists") since it looks
+    like simultaneously buying and selling the same contract. Checking for a
+    real position first avoids ever hitting that path in production.
+    """
+    client = get_trading_client()
+    try:
+        client.get_open_position(symbol)
+        return True
+    except Exception:
+        return False
+
+
+def cancel_open_orders_for_symbols(*symbols):
+    from alpaca.trading.requests import GetOrdersRequest
+    from alpaca.trading.enums import QueryOrderStatus
+
+    client = get_trading_client()
+    cancelled = []
+    for o in client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN)):
+        leg_symbols = {leg.symbol for leg in o.legs} if getattr(o, "legs", None) else {getattr(o, "symbol", None)}
+        if leg_symbols & set(symbols):
+            client.cancel_order_by_id(o.id)
+            cancelled.append(str(o.id))
+    return cancelled
+
+
+# ---------------------------------------------------------------------------
+# Order placement
+# ---------------------------------------------------------------------------
+
+def place_straddle_entry(call_symbol, put_symbol, notional_usd, limit_price):
+    """Submits a multi-leg (Level 3) order: buy 1 call + 1 put as one
+    combo order. UNTESTED against a live account -- verify this call shape
+    against your installed alpaca-py version before trusting it.
+    """
+    from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+    from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
+
+    client = get_trading_client()
+    qty = max(int(notional_usd // (limit_price * 100)), 1)  # 1 contract = 100 shares equiv
+
+    order = LimitOrderRequest(
+        qty=qty,
+        order_class=OrderClass.MLEG,
+        time_in_force=TimeInForce.DAY,
+        limit_price=round(limit_price, 2),
+        legs=[
+            OptionLegRequest(symbol=call_symbol, side=OrderSide.BUY, ratio_qty=1),
+            OptionLegRequest(symbol=put_symbol, side=OrderSide.BUY, ratio_qty=1),
+        ],
+    )
+    return client.submit_order(order)
+
+
+def close_straddle(call_symbol, put_symbol):
+    """Closes both legs. UNTESTED -- same caveat as place_straddle_entry."""
+    from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+    from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
+
+    client = get_trading_client()
+    call_px = get_latest_option_quote_mid(call_symbol)
+    put_px = get_latest_option_quote_mid(put_symbol)
+
+    order = LimitOrderRequest(
+        qty=1,
+        order_class=OrderClass.MLEG,
+        time_in_force=TimeInForce.DAY,
+        limit_price=round(call_px + put_px, 2),
+        legs=[
+            OptionLegRequest(symbol=call_symbol, side=OrderSide.SELL, ratio_qty=1),
+            OptionLegRequest(symbol=put_symbol, side=OrderSide.SELL, ratio_qty=1),
+        ],
+    )
+    return client.submit_order(order), call_px + put_px
+
+
+# ---------------------------------------------------------------------------
+# Daily check -- entry point for the cron job
+# ---------------------------------------------------------------------------
+
+def run_daily_check(upcoming_earnings):
+    """`upcoming_earnings` is the same {ticker: {date, time}} shape the
+    frontend already builds from GET /earnings. Called once a day by the
+    insignia-paper-trading cron entry in render.yaml.
+    """
+    init_db()
+    model, feature_names = get_model()
+    client = get_trading_client()
+    account = client.get_account()
+    equity = float(account.equity)
+
+    results = {"entries": [], "exits": [], "skipped": [], "errors": []}
+
+    # --- exits: any open position whose ticker just hit dbe == 0 ---
+    for trade in get_open_positions():
+        info = upcoming_earnings.get(trade["ticker"])
+        dbe = compute_dbe(info["date"], info.get("time", "TBD")) if info else None
+        if dbe == 0:
+            try:
+                call_filled = has_open_position(trade["call_symbol"])
+                put_filled = has_open_position(trade["put_symbol"])
+                if not (call_filled and put_filled):
+                    # entry order never actually filled -- there's nothing to
+                    # close. Cancel any still-resting order on these legs and
+                    # record the trade honestly instead of treating it as a
+                    # closed position with real P&L.
+                    cancelled = cancel_open_orders_for_symbols(trade["call_symbol"], trade["put_symbol"])
+                    mark_trade_unfilled_expired(
+                        trade["id"],
+                        notes=f"entry never filled by dbe=0 (call_filled={call_filled}, put_filled={put_filled}); cancelled orders: {cancelled}",
+                    )
+                    results["skipped"].append({"ticker": trade["ticker"], "reason": "entry never filled -- expired unfilled at dbe=0"})
+                    continue
+                order, exit_value = close_straddle(trade["call_symbol"], trade["put_symbol"])
+                record_trade_exit(trade["id"], exit_value, str(order.id))
+                results["exits"].append({"ticker": trade["ticker"], "exit_value": exit_value})
+            except Exception as e:
+                results["errors"].append({"ticker": trade["ticker"], "stage": "exit", "error": str(e)})
+
+    # --- entries: tickers currently at dbe 2-3 with no open position yet ---
+    for ticker, info in upcoming_earnings.items():
+        dbe = compute_dbe(info["date"], info.get("time", "TBD"))
+        er_date = info["date"]
+        if dbe is None or not (ENTRY_DBE_MIN <= dbe <= ENTRY_DBE_MAX):
+            continue
+        if get_open_trade(ticker, er_date):
+            continue
+        try:
+            feat, call_sym, put_sym, entry_cost = compute_live_features(ticker, dbe)
+            x = pd.DataFrame([{c: feat.get(c, np.nan) for c in feature_names}], columns=feature_names)
+            predicted_log_ratio = float(model.predict(x)[0])
+
+            if predicted_log_ratio < THRESHOLD:
+                log_signal(ticker, er_date, dbe, predicted_log_ratio, "skipped_threshold")
+                results["skipped"].append({"ticker": ticker, "reason": "below threshold", "predicted_log_ratio": predicted_log_ratio})
+                continue
+
+            position_size_usd = equity * POSITION_FRACTION
+            if position_size_usd > float(account.buying_power):
+                log_signal(ticker, er_date, dbe, predicted_log_ratio, "skipped_no_cash")
+                results["skipped"].append({"ticker": ticker, "reason": "insufficient buying power"})
+                continue
+
+            order = place_straddle_entry(call_sym, put_sym, position_size_usd, entry_cost)
+            record_trade_entry(ticker, er_date, call_sym, put_sym, predicted_log_ratio,
+                                position_size_usd, entry_cost, str(order.id))
+            log_signal(ticker, er_date, dbe, predicted_log_ratio, "entered")
+            results["entries"].append({"ticker": ticker, "predicted_log_ratio": predicted_log_ratio, "position_size_usd": position_size_usd})
+
+        except Exception as e:
+            log_signal(ticker, er_date, dbe, None, "error", detail=str(e))
+            results["errors"].append({"ticker": ticker, "stage": "entry", "error": str(e)})
+
+    return results

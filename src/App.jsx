@@ -4,6 +4,7 @@ import AnalysisDetailScreen from "./components/AnalysisDetailScreen";
 import EarningsScreen from "./components/EarningsScreen";
 import AnalysisScreen from "./components/AnalysisScreen";
 import SettingsScreen from "./components/SettingsScreen";
+import PaperTradingScreen from "./components/PaperTradingScreen";
 import SplashScreen from "./components/SplashScreen";
 import { API_BASE } from "./data/tickers";
 
@@ -57,6 +58,8 @@ export default function App() {
         <EarningsScreen onTab={handleTab} />
       ) : activeTab === "Analysis" ? (
         <AnalysisScreen onTab={handleTab} />
+      ) : activeTab === "Trading" ? (
+        <PaperTradingScreen onTab={handleTab} />
       ) : activeTab === "Settings" ? (
         <SettingsScreen onTab={handleTab} isDark={isDark} setIsDark={setIsDark} />
       ) : null}
