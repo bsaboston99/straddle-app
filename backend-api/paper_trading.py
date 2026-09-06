@@ -3,9 +3,25 @@ Paper trading engine for the earnings-straddle strategy.
 
 Scope and honesty check up front: the ledger, rule logic, and position sizing
 here follow exactly what was calibrated and agreed on earlier (entry when
-dbe is 2 or 3 and the model's predicted_log_ratio >= 0.3, exit at dbe == 0,
-10% of current equity per trade, no hard concurrency cap -- just skip a
-signal if there isn't enough buying power). That part is solid.
+dbe is 2 or 3 and the model's predicted_log_ratio >= 0.3, 10% of current
+equity per trade, no hard concurrency cap -- just skip a signal if there
+isn't enough buying power). That part is solid.
+
+Exit is now two-layered. The model's predicted_log_ratio at entry sets a
+concrete target_rel_straddle_a (entry_rel_straddle_a * exp(predicted_log_ratio)),
+and every day the position is open before dbe==0, a fresh rel_straddle_a is
+computed for the held contracts and compared against that target -- hit it,
+and the position sells immediately instead of waiting. dbe==0 remains a hard
+backstop exit regardless of the target, since holding through the actual
+earnings print was never part of this strategy.
+
+CAVEAT worth being honest about: the model was trained to predict
+rel_straddle_a movement between historical (entry_dbe, exit_dbe) pairs, not
+to predict a day-by-day path or a reliable "peak" level. Selling the moment
+the predicted ratio is reached is a reasonable, literal reading of "let the
+model decide," but that exact rule hasn't been backtested on its own the way
+the entry threshold was -- worth watching the first several trades closely
+before trusting it as much as the entry side.
 
 The Alpaca option-contract-lookup and multi-leg order submission calls below
 are written against alpaca-py's documented API shape, but have NOT been run
@@ -17,11 +33,13 @@ with real (paper) order flow, and expect to adjust call shapes if alpaca-py
 has moved since this was written.
 
 Storage: SQLite via stdlib sqlite3, in a single file (paper_trading.db).
-This is fine for local development, but Render's default web service disk is
-EPHEMERAL -- a redeploy or restart can wipe it. Before relying on this in
-production, either attach a Render persistent disk and point DB_PATH at it,
-or migrate this module to a real Postgres connection (Render has a managed
-tier). The schema is simple enough that porting it later is not a rewrite.
+Locally this just lands in ./data/. In production, DB_PATH is driven by the
+PAPER_TRADING_DB env var (see render.yaml), which points at a Render
+persistent disk mounted on insignia-api -- so a redeploy or restart no
+longer wipes the ledger the way it would on the service's own ephemeral
+filesystem. If this ever needs to scale past a single instance (persistent
+disks don't support that), migrating to a real Postgres connection is the
+next step; the schema is simple enough that porting it later isn't a rewrite.
 """
 import os
 import sqlite3
@@ -147,10 +165,27 @@ def init_db():
                 status TEXT NOT NULL DEFAULT 'open',   -- "open" | "closed" | "expired_unfilled" | "error"
                 alpaca_entry_order_id TEXT,
                 alpaca_exit_order_id TEXT,
+                entry_rel_straddle_a REAL,
+                target_rel_straddle_a REAL,
+                qty INTEGER,
                 notes TEXT,
                 UNIQUE(ticker, er_date)
             )
         """)
+        # Migration for a trades table that already existed before the
+        # target-exit columns above were added -- CREATE TABLE IF NOT EXISTS
+        # is a no-op on an existing table, so an older db file needs these
+        # added explicitly. Safe to run every startup: ADD COLUMN on a
+        # column that already exists just raises, which is ignored.
+        for col, coltype in [
+            ("entry_rel_straddle_a", "REAL"),
+            ("target_rel_straddle_a", "REAL"),
+            ("qty", "INTEGER"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {coltype}")
+            except sqlite3.OperationalError:
+                pass
         conn.commit()
 
 
@@ -173,14 +208,17 @@ def get_open_trade(ticker, er_date):
 
 
 def record_trade_entry(ticker, er_date, call_symbol, put_symbol, predicted_log_ratio,
-                        position_size_usd, entry_cost, order_id, notes=""):
+                        position_size_usd, entry_cost, order_id, entry_rel_straddle_a=None,
+                        target_rel_straddle_a=None, qty=1, notes=""):
     with get_db() as conn:
         conn.execute(
             "INSERT INTO trades (ticker, er_date, entry_date, call_symbol, put_symbol, "
-            "predicted_log_ratio, position_size_usd, entry_cost, status, alpaca_entry_order_id, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)",
+            "predicted_log_ratio, position_size_usd, entry_cost, status, alpaca_entry_order_id, "
+            "entry_rel_straddle_a, target_rel_straddle_a, qty, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
             (ticker, er_date, date.today().isoformat(), call_symbol, put_symbol,
-             predicted_log_ratio, position_size_usd, entry_cost, order_id, notes),
+             predicted_log_ratio, position_size_usd, entry_cost, order_id,
+             entry_rel_straddle_a, target_rel_straddle_a, qty, notes),
         )
 
 
@@ -438,6 +476,43 @@ def compute_live_features(ticker, dbe):
 # closing this gap before trusting live signals as much as the backtest.
 
 
+def parse_occ_expiration(symbol):
+    """OCC option symbols end with a fixed 15-char suffix regardless of how
+    long the ticker is: 6-digit date (YYMMDD) + 1-char type (C/P) + 8-digit
+    strike. Pulling the date back out of a symbol we already hold avoids
+    needing a schema change just to remember each position's expiration.
+    """
+    date_str = symbol[-15:-9]
+    return datetime.strptime(date_str, "%y%m%d").date()
+
+
+def get_live_rel_straddle_for_position(call_symbol, put_symbol):
+    """Re-quotes the HELD contracts (not a fresh ATM pick -- we already own
+    these) and re-picks a fresh ATM SPY straddle at a comparable expiration,
+    to compute today's rel_straddle_a for an open position -- the same
+    SPY-normalized ratio the entry target was set in, recomputed daily the
+    same way the historical data recomputes it (fresh ATM SPY strikes each
+    day, not the same SPY strikes locked in at entry).
+
+    Returns (closestraddle_a, rel_straddle_a) -- rel_straddle_a is None if
+    the SPY leg can't be priced for some reason, so callers can skip the
+    target check for that day rather than crashing the whole daily run.
+    """
+    call_px = get_latest_option_quote_mid(call_symbol)
+    put_px = get_latest_option_quote_mid(put_symbol)
+    closestraddle_a = call_px + put_px
+
+    exp_date = parse_occ_expiration(call_symbol)
+    remaining_dte = max((exp_date - date.today()).days, 0)
+    spy_call_sym, spy_put_sym, _, _ = find_atm_option_pair("SPY", target_dte_days=remaining_dte)
+    spy_call_px = get_latest_option_quote_mid(spy_call_sym)
+    spy_put_px = get_latest_option_quote_mid(spy_put_sym)
+    closespystraddle_a = spy_call_px + spy_put_px
+
+    rel_straddle_a = closestraddle_a / closespystraddle_a if closespystraddle_a else None
+    return closestraddle_a, rel_straddle_a
+
+
 def mark_trade_unfilled_expired(trade_id, notes=""):
     with get_db() as conn:
         conn.execute(
@@ -504,11 +579,16 @@ def place_straddle_entry(call_symbol, put_symbol, notional_usd, limit_price):
             OptionLegRequest(symbol=put_symbol, side=OrderSide.BUY, ratio_qty=1),
         ],
     )
-    return client.submit_order(order)
+    return client.submit_order(order), qty
 
 
-def close_straddle(call_symbol, put_symbol):
-    """Closes both legs. UNTESTED -- same caveat as place_straddle_entry."""
+def close_straddle(call_symbol, put_symbol, qty=1):
+    """Closes both legs. `qty` must match how many contracts were actually
+    bought at entry -- this used to be hardcoded to 1 regardless of real
+    position size, which would only partially close (or reject on) any
+    trade sized to more than 1 contract. Fixed alongside the target-exit
+    work below since both exit paths call this.
+    """
     from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
     from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
 
@@ -517,7 +597,7 @@ def close_straddle(call_symbol, put_symbol):
     put_px = get_latest_option_quote_mid(put_symbol)
 
     order = LimitOrderRequest(
-        qty=1,
+        qty=qty,
         order_class=OrderClass.MLEG,
         time_in_force=TimeInForce.DAY,
         limit_price=round(call_px + put_px, 2),
@@ -535,21 +615,47 @@ def close_straddle(call_symbol, put_symbol):
 
 def run_daily_check(upcoming_earnings):
     """`upcoming_earnings` is the same {ticker: {date, time}} shape the
-    frontend already builds from GET /earnings. Called once a day by the
-    insignia-paper-trading cron entry in render.yaml.
+    frontend already builds from GET /earnings. Despite the name, this is
+    now called every few minutes during market hours by the
+    insignia-paper-trading cron entry in render.yaml -- "daily" describes
+    the original design, not the current call cadence. A market-hours guard
+    below makes off-hours/weekend invocations a cheap near-instant no-op
+    rather than doing real work against stale or unavailable quotes.
+
+    Exit logic has two layers:
+      1. Target exit: on every call while a position is open and dbe > 0,
+         re-quote the held contracts and re-pick a fresh ATM SPY straddle to
+         compute the current rel_straddle_a, and sell as soon as it reaches
+         the target set at entry (target_rel_straddle_a = entry_rel_straddle_a
+         * exp(predicted_log_ratio) -- the model's own predicted move, turned
+         into a concrete level to sell at instead of waiting blindly).
+      2. Backstop exit: dbe == 0 always exits regardless of the target --
+         holding through the actual earnings print was never part of this
+         strategy and changes the risk profile entirely.
     """
+    client = get_trading_client()
+    clock = client.get_clock()
+    if not clock.is_open:
+        # Nothing to do outside market hours -- option quotes are stale or
+        # unavailable, and dbe (a whole-trading-day count) can't change
+        # between now and the next open anyway. Returning immediately here,
+        # before init_db()/get_model() even run, is what makes polling this
+        # every few minutes around the clock cheap rather than wasteful.
+        return {"entries": [], "exits": [], "skipped": [], "errors": [], "market_open": False}
+
     init_db()
     model, feature_names = get_model()
-    client = get_trading_client()
     account = client.get_account()
     equity = float(account.equity)
 
-    results = {"entries": [], "exits": [], "skipped": [], "errors": []}
+    results = {"entries": [], "exits": [], "skipped": [], "errors": [], "market_open": True}
 
-    # --- exits: any open position whose ticker just hit dbe == 0 ---
+    # --- exits: target hit, or the dbe==0 backstop ---
     for trade in get_open_positions():
         info = upcoming_earnings.get(trade["ticker"])
         dbe = compute_dbe(info["date"], info.get("time", "TBD")) if info else None
+        qty = trade.get("qty") or 1
+
         if dbe == 0:
             try:
                 call_filled = has_open_position(trade["call_symbol"])
@@ -566,11 +672,44 @@ def run_daily_check(upcoming_earnings):
                     )
                     results["skipped"].append({"ticker": trade["ticker"], "reason": "entry never filled -- expired unfilled at dbe=0"})
                     continue
-                order, exit_value = close_straddle(trade["call_symbol"], trade["put_symbol"])
-                record_trade_exit(trade["id"], exit_value, str(order.id))
-                results["exits"].append({"ticker": trade["ticker"], "exit_value": exit_value})
+                order, exit_value = close_straddle(trade["call_symbol"], trade["put_symbol"], qty=qty)
+                record_trade_exit(trade["id"], exit_value, str(order.id), notes="backstop exit at dbe=0")
+                results["exits"].append({"ticker": trade["ticker"], "exit_value": exit_value, "reason": "dbe_backstop"})
             except Exception as e:
                 results["errors"].append({"ticker": trade["ticker"], "stage": "exit", "error": str(e)})
+            continue
+
+        if dbe is None or dbe <= 0:
+            # Ticker fell out of the earnings calendar window, or dbe is
+            # negative (past the print already). Either way there's nothing
+            # safe to auto-decide here -- leave it for manual review rather
+            # than guessing at intent.
+            continue
+
+        if trade.get("target_rel_straddle_a") is None:
+            # entered before the target-exit columns existed -- nothing to
+            # check against; falls through to the dbe==0 backstop only.
+            continue
+
+        try:
+            if not (has_open_position(trade["call_symbol"]) and has_open_position(trade["put_symbol"])):
+                continue  # entry hasn't filled yet -- nothing to monitor
+            _, rel_straddle_a = get_live_rel_straddle_for_position(trade["call_symbol"], trade["put_symbol"])
+            target = trade["target_rel_straddle_a"]
+            if rel_straddle_a is not None and rel_straddle_a >= target:
+                order, exit_value = close_straddle(trade["call_symbol"], trade["put_symbol"], qty=qty)
+                record_trade_exit(
+                    trade["id"], exit_value, str(order.id),
+                    notes=f"target hit early at dbe={dbe}: rel_straddle_a={rel_straddle_a:.4f} >= target={target:.4f}",
+                )
+                log_signal(trade["ticker"], trade["er_date"], dbe, None, "exited_target",
+                           detail=f"rel_straddle_a={rel_straddle_a:.4f} target={target:.4f}")
+                results["exits"].append({"ticker": trade["ticker"], "exit_value": exit_value, "reason": "target_hit"})
+            else:
+                log_signal(trade["ticker"], trade["er_date"], dbe, None, "holding",
+                           detail=f"rel_straddle_a={rel_straddle_a} target={target}")
+        except Exception as e:
+            results["errors"].append({"ticker": trade["ticker"], "stage": "target_check", "error": str(e)})
 
     # --- entries: tickers currently at dbe 2-3 with no open position yet ---
     for ticker, info in upcoming_earnings.items():
@@ -596,11 +735,28 @@ def run_daily_check(upcoming_earnings):
                 results["skipped"].append({"ticker": ticker, "reason": "insufficient buying power"})
                 continue
 
-            order = place_straddle_entry(call_sym, put_sym, position_size_usd, entry_cost)
-            record_trade_entry(ticker, er_date, call_sym, put_sym, predicted_log_ratio,
-                                position_size_usd, entry_cost, str(order.id))
+            entry_rel_straddle_a = feat.get("rel_straddle_a")
+            target_rel_straddle_a = (
+                entry_rel_straddle_a * float(np.exp(predicted_log_ratio))
+                if entry_rel_straddle_a is not None and not np.isnan(entry_rel_straddle_a)
+                else None
+            )
+
+            order, qty = place_straddle_entry(call_sym, put_sym, position_size_usd, entry_cost)
+            record_trade_entry(
+                ticker, er_date, call_sym, put_sym, predicted_log_ratio,
+                position_size_usd, entry_cost, str(order.id),
+                entry_rel_straddle_a=entry_rel_straddle_a,
+                target_rel_straddle_a=target_rel_straddle_a,
+                qty=qty,
+            )
             log_signal(ticker, er_date, dbe, predicted_log_ratio, "entered")
-            results["entries"].append({"ticker": ticker, "predicted_log_ratio": predicted_log_ratio, "position_size_usd": position_size_usd})
+            results["entries"].append({
+                "ticker": ticker,
+                "predicted_log_ratio": predicted_log_ratio,
+                "position_size_usd": position_size_usd,
+                "target_rel_straddle_a": target_rel_straddle_a,
+            })
 
         except Exception as e:
             log_signal(ticker, er_date, dbe, None, "error", detail=str(e))

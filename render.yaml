@@ -19,6 +19,19 @@ services:
         sync: false
       - key: ALPACA_BASE_URL
         value: https://paper-api.alpaca.markets
+      - key: PAPER_TRADING_DB
+        value: /var/data/paper_trading.db
+    disk:
+      # Fixes the ephemeral-disk risk noted in paper_trading.py: without
+      # this, a redeploy or restart of insignia-api wipes the trade ledger,
+      # since the default web service filesystem isn't persisted. $0.25/mo
+      # minimum (1GB) -- paper_trading.db is currently ~24KB, nowhere near
+      # a real constraint here. paper_trading.py already reads its db path
+      # from PAPER_TRADING_DB (see above), so no code change was needed --
+      # just mounting the disk and pointing that env var at it.
+      name: paper-trading-data
+      mountPath: /var/data
+      sizeGB: 1
 
   # ── React / Vite frontend ─────────────────────────────────────────────────
   - type: web
@@ -45,16 +58,21 @@ services:
     schedule: "0 14 * * 1-5"  # 9am ET Mon–Fri (UTC-5)
     startCommand: python -c "import requests; requests.post('https://insignia-api-qkex.onrender.com/alerts/trigger')"
 
-  # ── Daily paper-trading signal check + entry/exit execution ────────────────
-  # Same pattern as insignia-alerts above. Runs once a day, near the close,
-  # since this strategy trades on daily closes rather than intraday moves.
-  # NOTE: fixed UTC offset like the alerts cron above -- doesn't auto-adjust
-  # for daylight saving. 20:45 UTC = 3:45pm ET during EDT (most of the year);
-  # during EST (~Nov-Mar) that becomes 2:45pm ET. Adjust if that drift matters.
+  # ── Continuous paper-trading signal check + entry/exit execution ───────────
+  # Polls every 5 minutes, weekdays only -- the actual market-hours gate
+  # lives server-side in paper_trading.run_daily_check() (checks Alpaca's
+  # own market clock), so this schedule just bounds it to roughly the right
+  # days; off-hours calls within those days return almost immediately as a
+  # no-op rather than doing real work against stale quotes. Render bills
+  # cron jobs per second of actual execution, not by uptime, so this cadence
+  # costs negligibly more than the old once-a-day version -- the real reason
+  # to run this often is catching the model's target-exit level (see
+  # paper_trading.py) as soon as it's hit intraday, instead of only once a
+  # day and potentially missing a move that reverses before the next check.
   - type: cron
     name: insignia-paper-trading
     runtime: python
     rootDir: backend-api
     buildCommand: pip install requests
-    schedule: "45 20 * * 1-5"
+    schedule: "*/5 * * * 1-5"
     startCommand: python -c "import requests; requests.post('https://insignia-api-qkex.onrender.com/paper-trading/run-daily-check')"
