@@ -58,6 +58,8 @@ import joblib
 import numpy as np
 import pandas as pd
 
+import notifications
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -266,6 +268,20 @@ def get_performance_summary():
         "avg_pnl_pct": round(sum(t["pnl_pct"] for t in closed) / len(closed), 1) if closed else None,
         "total_pnl_usd": round(sum(t["pnl_usd"] for t in closed if t["pnl_usd"] is not None), 2) if closed else 0.0,
     }
+
+
+def notify_trade(title: str, body: str):
+    """Push a notification for a real buy/sell action, in the exact same
+    format (and to the exact same subscriber list) as the existing
+    /alerts push notifications -- see notifications.py. Never raises: a
+    push failure should never be allowed to break the trade it's reporting
+    on, since by the time this is called the actual order has already gone
+    through.
+    """
+    try:
+        notifications.send_push_to_all(title, body)
+    except Exception as e:
+        print(f"Trade notification error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +691,12 @@ def run_daily_check(upcoming_earnings):
                 order, exit_value = close_straddle(trade["call_symbol"], trade["put_symbol"], qty=qty)
                 record_trade_exit(trade["id"], exit_value, str(order.id), notes="backstop exit at dbe=0")
                 results["exits"].append({"ticker": trade["ticker"], "exit_value": exit_value, "reason": "dbe_backstop"})
+                pnl_pct = (exit_value - trade["entry_cost"]) / trade["entry_cost"] * 100 if trade.get("entry_cost") else None
+                pnl_str = f" ({pnl_pct:+.1f}%)" if pnl_pct is not None else ""
+                notify_trade(
+                    f"Insignia Sell — {trade['ticker']}",
+                    f"Sold {trade['ticker']} straddle ahead of earnings (mandatory exit). Exit value: ${exit_value:,.2f}{pnl_str}.",
+                )
             except Exception as e:
                 results["errors"].append({"ticker": trade["ticker"], "stage": "exit", "error": str(e)})
             continue
@@ -705,6 +727,12 @@ def run_daily_check(upcoming_earnings):
                 log_signal(trade["ticker"], trade["er_date"], dbe, None, "exited_target",
                            detail=f"rel_straddle_a={rel_straddle_a:.4f} target={target:.4f}")
                 results["exits"].append({"ticker": trade["ticker"], "exit_value": exit_value, "reason": "target_hit"})
+                pnl_pct = (exit_value - trade["entry_cost"]) / trade["entry_cost"] * 100 if trade.get("entry_cost") else None
+                pnl_str = f" ({pnl_pct:+.1f}%)" if pnl_pct is not None else ""
+                notify_trade(
+                    f"Insignia Sell — {trade['ticker']}",
+                    f"Sold {trade['ticker']} straddle early — target hit at dbe={dbe}. Exit value: ${exit_value:,.2f}{pnl_str}.",
+                )
             else:
                 log_signal(trade["ticker"], trade["er_date"], dbe, None, "holding",
                            detail=f"rel_straddle_a={rel_straddle_a} target={target}")
@@ -757,6 +785,12 @@ def run_daily_check(upcoming_earnings):
                 "position_size_usd": position_size_usd,
                 "target_rel_straddle_a": target_rel_straddle_a,
             })
+            predicted_pct = (np.exp(predicted_log_ratio) - 1) * 100
+            notify_trade(
+                f"Insignia Buy — {ticker}",
+                f"Bought {ticker} straddle ahead of its {er_date} earnings. "
+                f"Model predicts {predicted_pct:+.0f}% move, position size ${position_size_usd:,.0f}.",
+            )
 
         except Exception as e:
             log_signal(ticker, er_date, dbe, None, "error", detail=str(e))

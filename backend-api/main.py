@@ -486,27 +486,16 @@ def debug_nasdaq(date_str: str):
 
 
 # ── Push Notifications ────────────────────────────────────────────────────────
+# The actual VAPID config, subscriber list, and send_push() now live in
+# notifications.py, shared with paper_trading.py -- so a straddle alert and
+# a paper trade (buy/sell) fire through the exact same code path instead of
+# two copies of this that could quietly drift apart.
+from notifications import VAPID_PUBLIC_KEY, load_subscriptions, save_subscriptions, send_push
 
-VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "")
-VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
-VAPID_CLAIMS      = {"sub": "mailto:bsandersonn99@gmail.com"}
-
-SUBSCRIPTIONS_FILE = Path(__file__).parent / "push_subscriptions.json"
 ALERTS_CONFIG_FILE = Path(__file__).parent / "alerts_config.json"
 
 WATCHLIST = ["NVDA", "ORCL", "ADBE", "TSLA", "AMZN", "META", "SPY"]
 
-
-def load_subscriptions() -> list:
-    try:
-        if SUBSCRIPTIONS_FILE.exists():
-            return json.loads(SUBSCRIPTIONS_FILE.read_text())
-    except Exception:
-        pass
-    return []
-
-def save_subscriptions(subs: list):
-    SUBSCRIPTIONS_FILE.write_text(json.dumps(subs))
 
 def load_alerts_config() -> dict:
     try:
@@ -553,22 +542,6 @@ def set_alerts_config(config: AlertsConfig):
 @app.get("/alerts/config")
 def get_alerts_config():
     return load_alerts_config()
-
-
-def send_push(subscription: dict, title: str, body: str):
-    """Send a single Web Push notification."""
-    try:
-        from pywebpush import webpush, WebPushException
-        # Env vars lose real newlines — restore them from literal \n
-        private_key = VAPID_PRIVATE_KEY.replace("\\n", "\n")
-        webpush(
-            subscription_info=subscription,
-            data=json.dumps({"title": title, "body": body}),
-            vapid_private_key=private_key,
-            vapid_claims=VAPID_CLAIMS,
-        )
-    except Exception as e:
-        print(f"Push send error: {e}")
 
 
 @app.post("/push/test")
