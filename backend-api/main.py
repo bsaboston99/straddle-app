@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from straddle_analysis import load_all_data, add_relative_straddles, get_straddle_percentile, get_straddle_percentile_live
 import paper_trading
+import live_quotes
 
 app = FastAPI()
 
@@ -26,16 +27,6 @@ COMBINED_DIR = Path(os.environ.get(
     "COMBINED_DIR",
     Path(__file__).parent / "data" / "combined_daily"
 ))
-
-MOCK_LIVE = {
-    "NVDA": {"close_a": 0.0522, "close_b": 0.0669, "spy_close_a": 0.0078, "spy_close_b": 0.0151},
-    "ORCL": {"close_a": 0.0666, "close_b": 0.0829, "spy_close_a": 0.0078, "spy_close_b": 0.0151},
-    "ADBE": {"close_a": 0.0561, "close_b": 0.0698, "spy_close_a": 0.0078, "spy_close_b": 0.0151},
-    "TSLA": {"close_a": 0.1028, "close_b": 0.1289, "spy_close_a": 0.0078, "spy_close_b": 0.0151},
-    "AMZN": {"close_a": 0.0675, "close_b": 0.0852, "spy_close_a": 0.0078, "spy_close_b": 0.0151},
-    "META": {"close_a": 0.0592, "close_b": 0.0738, "spy_close_a": 0.0078, "spy_close_b": 0.0151},
-    "SPY":  {"close_a": 0.0208, "close_b": 0.0271, "spy_close_a": 0.0208, "spy_close_b": 0.0271},
-}
 
 df_global = None
 
@@ -270,8 +261,13 @@ def get_straddle(ticker: str, dbe: int = 0):
     sym = ticker.upper()
 
     try:
-        if sym in MOCK_LIVE:
-            live = MOCK_LIVE[sym]
+        live = None
+        try:
+            live = live_quotes.get_live_straddle_inputs(sym)
+        except Exception as e:
+            print(f"Live quote fetch failed for {sym}, falling back to historical: {e}")
+
+        if live:
             result = get_straddle_percentile_live(
                 df_global,
                 ticker=sym,
@@ -576,7 +572,12 @@ def trigger_alerts():
     triggered = []
     for sym in WATCHLIST:
         try:
-            live = MOCK_LIVE.get(sym)
+            live = None
+            try:
+                live = live_quotes.get_live_straddle_inputs(sym)
+            except Exception as e:
+                print(f"Live quote fetch failed for {sym}: {e}")
+
             if live:
                 result = get_straddle_percentile_live(
                     df_global, ticker=sym, dbe=0,
