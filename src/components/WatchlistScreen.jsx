@@ -103,6 +103,16 @@ function TickerRow({ sym, onClick, earningsMap, live }) {
         <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2 }}>{subLabel}</div>
         {hasPct ? (
           <div style={{ marginTop: 6, width: 90 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 3 }}>
+              <span style={{
+                width: 5, height: 5, borderRadius: "50%",
+                background: live.is_live ? "var(--blue)" : "var(--text4)",
+                flexShrink: 0
+              }} />
+              <span style={{ fontSize: 9, color: live.is_live ? "var(--blue)" : "var(--text4)", letterSpacing: "0.02em" }}>
+                {live.is_live ? "Live" : "Historical"}
+              </span>
+            </div>
             <MiniBar pct={live.pct_a}  sig={live.signal_a}  label="A" />
             <MiniBar pct={live.pct_b}  sig={live.signal_b}  label="B" />
             <MiniBar pct={live.pct_ep} sig={live.signal_ep} label="EP" />

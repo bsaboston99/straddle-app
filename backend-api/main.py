@@ -305,6 +305,8 @@ def get_straddle(ticker: str, dbe: int = 0):
             result = get_straddle_percentile(df_global, ticker=sym, dbe=dbe)
 
         response = {
+            "is_live":          live is not None,
+            "as_of":            datetime.now().isoformat(),
             "ticker":           result["ticker"],
             "dbe":              result["dbe"],
             "pct_a":            result["pct_a"],
@@ -604,28 +606,30 @@ def get_watchlist_live():
         if ticker in live_tickers:
             try:
                 live = live_quotes.get_live_straddle_inputs(ticker, _spy_cache=spy_cache)
-                return get_straddle_percentile_live(
+                result = get_straddle_percentile_live(
                     ticker_df, ticker=ticker, dbe=0,
                     live_close_a=live["close_a"], live_close_b=live["close_b"],
                     live_spy_close_a=live["spy_close_a"], live_spy_close_b=live["spy_close_b"],
                 )
+                return result, True
             except Exception:
                 pass  # falls through to the historical path below
         try:
-            return get_straddle_percentile(ticker_df, ticker=ticker, dbe=0)
+            return get_straddle_percentile(ticker_df, ticker=ticker, dbe=0), False
         except Exception:
-            return None
+            return None, False
 
+    now_iso = datetime.now().isoformat()
     results = {}
     with ThreadPoolExecutor(max_workers=15) as executor:
         futures = {executor.submit(compute_one, t): t for t in tickers}
         for future in as_completed(futures):
             ticker = futures[future]
             try:
-                result = future.result()
+                result, is_live = future.result()
             except Exception as e:
                 print(f"Watchlist live compute failed for {ticker}: {e}")
-                result = None
+                result, is_live = None, False
             if result is None:
                 continue
 
@@ -636,6 +640,8 @@ def get_watchlist_live():
             straddle_dollar = (straddle_pct * price) if (straddle_pct is not None and price is not None) else None
 
             results[ticker] = {
+                "is_live":         is_live,
+                "as_of":           now_iso,
                 "price":           price,
                 "change_pct":      change_pct,
                 "straddle_pct":    straddle_pct,

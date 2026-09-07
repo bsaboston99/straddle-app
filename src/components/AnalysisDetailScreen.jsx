@@ -307,11 +307,22 @@ export default function AnalysisDetailScreen({ ticker, onBack, onTab }) {
         {!liveLoading && !liveError && live && (
           <div style={{ background: "var(--surface)", margin: "16px 16px 0", borderRadius: 10, padding: "14px 16px", border: "0.5px solid var(--border)" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-              <span style={{ fontSize: 11, fontWeight: 500, color: "var(--text2)", textTransform: "uppercase", letterSpacing: "0.04em" }}>
-                Live Now
-              </span>
+              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{
+                  width: 6, height: 6, borderRadius: "50%",
+                  background: live.is_live ? "var(--blue)" : "var(--text4)"
+                }} />
+                <span style={{ fontSize: 11, fontWeight: 500, color: live.is_live ? "var(--blue)" : "var(--text2)", textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                  {live.is_live ? "Live Now" : "Latest Historical"}
+                </span>
+              </div>
               <CompositeBadge composite={live.composite} />
             </div>
+            {!live.is_live && (
+              <div style={{ fontSize: 10, color: "var(--text4)", marginTop: -6, marginBottom: 10 }}>
+                No live quote available right now for {ticker} -- showing its most recent DBE=0 archive value instead.
+              </div>
+            )}
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 12 }}>
               <div>
                 <div style={{ fontSize: 20, fontWeight: 600, color: "var(--text)" }}>
