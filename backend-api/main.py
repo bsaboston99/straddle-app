@@ -30,6 +30,11 @@ COMBINED_DIR = Path(os.environ.get(
 
 df_global = None
 
+# Per-ticker slices of df_global, rebuilt alongside it. Endpoints that loop
+# over many tickers (like /watchlist-live) filter/copy from this instead of
+# re-scanning the full 80k+-row df_global once per ticker.
+TICKER_GROUPS = {}
+
 FEATHER_CACHE = Path(__file__).parent / "df_cache.feather"
 
 def _get_parquet_mtime() -> float:
@@ -72,9 +77,10 @@ def _load_df() -> "pd.DataFrame | None":
 
 @app.on_event("startup")
 async def startup_event():
-    global df_global
+    global df_global, TICKER_GROUPS
     try:
         df_global = _load_df()
+        TICKER_GROUPS = {t: sub for t, sub in df_global.groupby("ticker")}
     except Exception as e:
         print(f"WARNING: Could not load data: {e}")
         df_global = None
@@ -87,11 +93,29 @@ async def startup_event():
     # Pre-warm earnings cache in background so first user doesn't wait
     asyncio.create_task(_prewarm_earnings())
 
+    # Pre-warm (and keep warm) the Watchlist live-data cache the same way,
+    # so a user opening the Watchlist tab almost always hits the 60s cache
+    # instead of triggering the live fetch themselves.
+    asyncio.create_task(_prewarm_watchlist_live())
+
 async def _prewarm_earnings():
     await asyncio.sleep(3)  # let server finish starting
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, lambda: get_earnings(universe="all", weeks=8))
     print("Earnings pre-warm complete.")
+
+async def _prewarm_watchlist_live():
+    await asyncio.sleep(5)  # let df_global/earnings pre-warm settle first
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            await loop.run_in_executor(None, get_watchlist_live)
+            print("Watchlist live pre-warm complete.")
+        except Exception as e:
+            print(f"Watchlist live pre-warm failed: {e}")
+        # Refresh a few seconds before the cache would otherwise expire, so
+        # there's effectively never a cold cache for a real request to hit.
+        await asyncio.sleep(max(WATCHLIST_LIVE_TTL_SECONDS - 5, 5))
 
 SP500 = [
     "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","BRK-B","JPM","UNH",
@@ -572,18 +596,23 @@ def get_watchlist_live():
     spy_cache = {}
 
     def compute_one(ticker):
+        # Per-ticker slice instead of the full 80k+-row df_global -- this
+        # function runs once per ticker on every /watchlist-live call, so
+        # skipping a full-table scan each time matters.
+        ticker_df = TICKER_GROUPS.get(ticker, df_global)
+
         if ticker in live_tickers:
             try:
                 live = live_quotes.get_live_straddle_inputs(ticker, _spy_cache=spy_cache)
                 return get_straddle_percentile_live(
-                    df_global, ticker=ticker, dbe=0,
+                    ticker_df, ticker=ticker, dbe=0,
                     live_close_a=live["close_a"], live_close_b=live["close_b"],
                     live_spy_close_a=live["spy_close_a"], live_spy_close_b=live["spy_close_b"],
                 )
             except Exception:
                 pass  # falls through to the historical path below
         try:
-            return get_straddle_percentile(df_global, ticker=ticker, dbe=0)
+            return get_straddle_percentile(ticker_df, ticker=ticker, dbe=0)
         except Exception:
             return None
 
