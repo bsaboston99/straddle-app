@@ -470,23 +470,39 @@ def get_analysis(dbe: int = 0):
     return response
 
 
-# Short-TTL cache for /watchlist-live -- this endpoint fans out to Alpaca for
-# every ticker in the dataset, so a 6-hour cache (like the historical
-# endpoints above) would defeat the point of it being "live," but no cache
-# at all would mean every Watchlist screen open re-fires a live batch quote
-# plus one live option-chain lookup per ticker. 60s keeps repeated opens/
+# Short-TTL cache for /watchlist-live -- this endpoint fans out to Alpaca, so
+# a 6-hour cache (like the historical endpoints above) would defeat the
+# point of it being "live," but no cache at all would mean every Watchlist
+# screen open re-fires the same batch of calls. 60s keeps repeated opens/
 # re-renders cheap while still refreshing about as often as the 5-minute
 # paper-trading poll.
 WATCHLIST_LIVE_CACHE = {}
 WATCHLIST_LIVE_TTL_SECONDS = 60
 
+# Alpaca throttles the whole account to 200 requests/minute, shared with the
+# paper-trading cron -- not per-endpoint. A live option-chain lookup costs
+# ~5-6 calls (stock price + option chain + up to 4 quotes), so doing that
+# for every ticker in the dataset (100+) would blow well past the limit on
+# a single refresh. Scoping live lookups to tickers with earnings in the
+# next couple weeks keeps this comfortably under budget while still making
+# the numbers live exactly where "live" actually matters -- everything
+# further out (or with no upcoming earnings at all) shows the same
+# historical percentile data the app already had before this feature.
+# MAX_LIVE_TICKERS is an extra hard cap in case an earnings-heavy week
+# still produces more near-term names than that budget comfortably allows.
+WATCHLIST_LIVE_EARNINGS_WEEKS = 2
+MAX_LIVE_TICKERS = 30
+
 
 @app.get("/watchlist-live")
 def get_watchlist_live():
-    """Live price, daily % change, and live-with-historical-fallback
-    percentile signal for every ticker in the dataset -- powers the
-    Watchlist screen's per-row display in place of the old dummyTicker()
-    fabricated placeholder values."""
+    """Live price, daily % change for every ticker, plus a live (with
+    historical fallback) percentile signal for tickers with near-term
+    earnings -- powers the Watchlist screen's per-row display in place of
+    the old dummyTicker() fabricated placeholder values. See the rate-limit
+    comment above for why only near-term tickers get the live percentile
+    calc; price/change is cheap (one batched call covers every ticker) so
+    every row still gets a real live price regardless."""
     if df_global is None:
         raise HTTPException(status_code=503, detail="Parquet data not loaded.")
 
@@ -496,8 +512,31 @@ def get_watchlist_live():
 
     tickers = sorted(df_global["ticker"].unique().tolist())
 
+    # Which tickers actually need a live option-chain lookup: those with
+    # earnings in the next WATCHLIST_LIVE_EARNINGS_WEEKS weeks, soonest
+    # first, capped at MAX_LIVE_TICKERS. Reuses the same NASDAQ earnings
+    # calendar /paper-trading/run-daily-check already pulls from.
+    live_tickers = set()
+    try:
+        earnings_resp = get_earnings(universe="all", weeks=WATCHLIST_LIVE_EARNINGS_WEEKS)
+        dated = []
+        for date_str, items in earnings_resp.get("grouped", {}).items():
+            for item in items:
+                dated.append((date_str, item["ticker"]))
+        dated.sort(key=lambda x: x[0])
+        for _, tkr in dated:
+            if tkr in live_tickers:
+                continue
+            live_tickers.add(tkr)
+            if len(live_tickers) >= MAX_LIVE_TICKERS:
+                break
+    except Exception as e:
+        print(f"Watchlist near-term earnings lookup failed, no tickers will get live percentile data: {e}")
+
     # Batch price + previous close for every ticker in as few live calls as
-    # possible (one Alpaca snapshot call per chunk, not one call per ticker).
+    # possible (one Alpaca snapshot call per chunk of 200, not one call per
+    # ticker) -- this alone stays cheap regardless of ticker count, so every
+    # row gets a real live price even if it's outside the live_tickers set.
     price_data = {}
     try:
         from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -522,23 +561,31 @@ def get_watchlist_live():
     except Exception as e:
         print(f"Watchlist price snapshot fetch failed entirely: {e}")
 
-    # Percentile signal + straddle value per ticker: live quote with a
-    # fallback to the historical calc, same pattern as /straddle/{ticker}.
-    # Run concurrently -- a live option-chain lookup is several sequential
-    # Alpaca calls on its own, and this runs it once per ticker.
+    # Percentile signal + straddle value per ticker: live quote (only for
+    # live_tickers) with a fallback to the historical calc, same pattern as
+    # /straddle/{ticker}. spy_cache is shared across every ticker in this
+    # batch -- most near-term tickers land on the same one or two nearest
+    # Fridays, so this turns what would be dozens of duplicate SPY calls
+    # into (at most) a couple of real ones. Run concurrently; even with the
+    # earnings-window scoping, a live lookup is several sequential Alpaca
+    # calls per ticker.
+    spy_cache = {}
+
     def compute_one(ticker):
-        try:
-            live = live_quotes.get_live_straddle_inputs(ticker)
-            return get_straddle_percentile_live(
-                df_global, ticker=ticker, dbe=0,
-                live_close_a=live["close_a"], live_close_b=live["close_b"],
-                live_spy_close_a=live["spy_close_a"], live_spy_close_b=live["spy_close_b"],
-            )
-        except Exception:
+        if ticker in live_tickers:
             try:
-                return get_straddle_percentile(df_global, ticker=ticker, dbe=0)
+                live = live_quotes.get_live_straddle_inputs(ticker, _spy_cache=spy_cache)
+                return get_straddle_percentile_live(
+                    df_global, ticker=ticker, dbe=0,
+                    live_close_a=live["close_a"], live_close_b=live["close_b"],
+                    live_spy_close_a=live["spy_close_a"], live_spy_close_b=live["spy_close_b"],
+                )
             except Exception:
-                return None
+                pass  # falls through to the historical path below
+        try:
+            return get_straddle_percentile(df_global, ticker=ticker, dbe=0)
+        except Exception:
+            return None
 
     results = {}
     with ThreadPoolExecutor(max_workers=15) as executor:

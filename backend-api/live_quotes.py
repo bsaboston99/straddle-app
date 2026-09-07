@@ -149,12 +149,26 @@ def get_ranked_expirations(ticker: str, num_expirations: int = 2, window_days: i
     return results
 
 
-def get_straddle_at_expiration(symbol: str, expiration: date) -> float:
+def get_straddle_at_expiration(symbol: str, expiration: date, _cache: dict = None) -> float:
     """Straddle (call mid + put mid) for `symbol` at one EXACT expiration
     date -- used to quote SPY at the ticker's own "a"/"b" dates rather than
     SPY's own independently-nearest expirations. See module docstring
     point 2. Raises if `symbol` has no listed contracts at that exact date.
+
+    `_cache`: an optional caller-owned dict used to memoize (symbol,
+    expiration) -> value across multiple calls. SPY is quoted at whatever
+    Friday the ticker's own "a"/"b" legs land on, and most tickers on a
+    given day share the same nearest one or two Fridays -- so across a
+    batch of tickers (see main.py's /watchlist-live), SPY would otherwise
+    be re-fetched for the same date dozens of times. Passing a shared dict
+    turns that into (at most) a couple of real Alpaca calls per batch,
+    which matters given Alpaca's 200-requests/minute account-wide cap.
     """
+    if _cache is not None:
+        key = (symbol, expiration)
+        if key in _cache:
+            return _cache[key]
+
     from alpaca.trading.requests import GetOptionContractsRequest
 
     spot_price = get_latest_stock_price(symbol)
@@ -188,10 +202,13 @@ def get_straddle_at_expiration(symbol: str, expiration: date) -> float:
     call_px = get_latest_option_quote_mid(best_call.symbol)
     put_px = get_latest_option_quote_mid(best_put.symbol)
     # Normalized by this symbol's own spot price -- see module docstring point 3.
-    return (call_px + put_px) / spot_price
+    result = (call_px + put_px) / spot_price
+    if _cache is not None:
+        _cache[(symbol, expiration)] = result
+    return result
 
 
-def get_live_straddle_inputs(ticker: str) -> dict:
+def get_live_straddle_inputs(ticker: str, _spy_cache: dict = None) -> dict:
     """Live equivalent of the old MOCK_LIVE[ticker] entry:
     {close_a, close_b, spy_close_a, spy_close_b} -- same shape
     get_straddle_percentile_live() already expects. `spy_close_a`/
@@ -201,13 +218,18 @@ def get_live_straddle_inputs(ticker: str) -> dict:
     expirations are available for the ticker, or if SPY has no matching
     contract at either of those exact dates -- so callers can fall back to
     the historical (non-live) path cleanly.
+
+    `_spy_cache`: optional shared dict passed straight through to
+    get_straddle_at_expiration() -- see that function's docstring. Pass
+    the SAME dict across many tickers in one batch to cut redundant SPY
+    calls; omit it for a single one-off lookup.
     """
     ticker_legs = get_ranked_expirations(ticker.upper())
     if len(ticker_legs) < 2:
         raise RuntimeError(f"Fewer than 2 Friday expirations found for {ticker}")
 
-    spy_close_a = get_straddle_at_expiration("SPY", ticker_legs[0]["expiration"])
-    spy_close_b = get_straddle_at_expiration("SPY", ticker_legs[1]["expiration"])
+    spy_close_a = get_straddle_at_expiration("SPY", ticker_legs[0]["expiration"], _cache=_spy_cache)
+    spy_close_b = get_straddle_at_expiration("SPY", ticker_legs[1]["expiration"], _cache=_spy_cache)
 
     return {
         "close_a": ticker_legs[0]["straddle"],
