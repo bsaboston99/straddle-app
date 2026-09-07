@@ -270,6 +270,30 @@ def get_performance_summary():
     }
 
 
+NOTIFY_CONFIG_FILE = Path(__file__).parent / "paper_trading_notify_config.json"
+
+
+def load_notify_config() -> dict:
+    """Separate on/off switch from the existing earnings-alerts toggle --
+    that one also owns the push subscribe/unsubscribe flow (see
+    SettingsScreen.jsx), so it can't double as a trade-notifications switch
+    without also risking unsubscribing the device entirely. This just gates
+    whether notify_trade() actually sends, using the same underlying
+    subscription either way. Defaults to on since trade notifications were
+    already working before this toggle existed.
+    """
+    try:
+        if NOTIFY_CONFIG_FILE.exists():
+            return json.loads(NOTIFY_CONFIG_FILE.read_text())
+    except Exception:
+        pass
+    return {"enabled": True}
+
+
+def save_notify_config(config: dict):
+    NOTIFY_CONFIG_FILE.write_text(json.dumps(config))
+
+
 def notify_trade(title: str, body: str):
     """Push a notification for a real buy/sell action, in the exact same
     format (and to the exact same subscriber list) as the existing
@@ -279,6 +303,8 @@ def notify_trade(title: str, body: str):
     through.
     """
     try:
+        if not load_notify_config().get("enabled", True):
+            return
         notifications.send_push_to_all(title, body)
     except Exception as e:
         print(f"Trade notification error: {e}")

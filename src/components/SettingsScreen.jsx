@@ -63,6 +63,26 @@ export default function SettingsScreen({ onTab, isDark, setIsDark }) {
     catch { return 25; }
   });
   const [pushStatus, setPushStatus] = useState("idle"); // idle | requesting | granted | denied | error
+  const [tradeNotifsEnabled, setTradeNotifsEnabled] = useState(true);
+
+  // Separate from the Alerts toggle above -- this one doesn't touch the
+  // push subscription itself (Alerts already owns that), it just gates
+  // whether the backend actually sends a trade-buy/sell notification.
+  useEffect(() => {
+    fetch(`${API_BASE}/paper-trading/notifications-config`)
+      .then(r => r.json())
+      .then(d => setTradeNotifsEnabled(d.enabled !== false))
+      .catch(() => {});
+  }, []);
+
+  function handleTradeNotifsToggle(val) {
+    setTradeNotifsEnabled(val);
+    fetch(`${API_BASE}/paper-trading/notifications-config`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: val }),
+    }).catch(() => {});
+  }
 
   // Restore push status on mount if permission was already granted
   useEffect(() => {
@@ -246,6 +266,20 @@ export default function SettingsScreen({ onTab, isDark, setIsDark }) {
           )}
         </div>
 
+        {/* Trading */}
+        <SectionHeader label="Trading" />
+        <div style={{ margin: "0 16px", background: "var(--surface)", borderRadius: 12, overflow: "hidden" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 16px" }}>
+            <div>
+              <div style={{ fontSize: 15, color: "var(--text)" }}>Trade Notifications</div>
+              <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 2 }}>
+                {tradeNotifsEnabled ? "Notified on every buy and sell" : "Trade notifications are off"}
+              </div>
+            </div>
+            <Toggle value={tradeNotifsEnabled} onChange={handleTradeNotifsToggle} />
+          </div>
+        </div>
+
         {/* Info note */}
         <div style={{
           margin: "10px 16px 0",
@@ -256,6 +290,19 @@ export default function SettingsScreen({ onTab, isDark, setIsDark }) {
           <IconInfo size={16} color="var(--text3)" />
           <div style={{ fontSize: 12, color: "var(--text3)", lineHeight: 1.55 }}>
             Alerts notify you when any watchlist ticker's earnings premium percentile drops below your threshold. Checks run daily. Requires Insignia to be added to your home screen.
+          </div>
+        </div>
+
+        {/* Info note (trading) */}
+        <div style={{
+          margin: "10px 16px 0",
+          padding: "12px 14px",
+          background: "var(--surface)", borderRadius: 12,
+          display: "flex", gap: 10, alignItems: "flex-start"
+        }}>
+          <IconInfo size={16} color="var(--text3)" />
+          <div style={{ fontSize: 12, color: "var(--text3)", lineHeight: 1.55 }}>
+            Trade notifications fire on every paper-trading buy and sell. They use the same push subscription as Alerts above, so turn Alerts on at least once to enable push on this device -- after that, this toggle works independently.
           </div>
         </div>
 

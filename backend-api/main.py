@@ -517,6 +517,9 @@ class AlertsConfig(BaseModel):
     enabled: bool
     threshold: int
 
+class TradeNotifyConfig(BaseModel):
+    enabled: bool
+
 
 @app.post("/push/subscribe")
 def subscribe(sub: PushSubscription):
@@ -631,6 +634,17 @@ def paper_trading_signals(limit: int = 200):
         return {"signals": paper_trading.get_recent_signals(limit=limit)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/paper-trading/notifications-config")
+def get_paper_trading_notify_config():
+    return paper_trading.load_notify_config()
+
+
+@app.post("/paper-trading/notifications-config")
+def set_paper_trading_notify_config(config: TradeNotifyConfig):
+    paper_trading.save_notify_config({"enabled": config.enabled})
+    return {"status": "saved"}
 
 
 @app.post("/paper-trading/run-daily-check")
