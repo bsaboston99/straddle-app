@@ -4,36 +4,6 @@ import { MiniBar } from "./MiniBar";
 import TabBar from "./TabBar";
 import { IconSearch, IconBell } from "./Icons";
 
-// Deterministic seeded random — same ticker always gets the same dummy values
-function seededRand(seed, offset = 0) {
-  const x = Math.sin(seed * 127.1 + offset * 311.7) * 43758.5453;
-  return x - Math.floor(x);
-}
-
-function dummyTicker(sym) {
-  const seed = sym.split("").reduce((a, c, i) => a + c.charCodeAt(0) * (i + 1), 0);
-  const r = (min, max, off) => min + seededRand(seed, off) * (max - min);
-  const price     = r(18, 480, 1);
-  const changePct = r(-4.5, 4.5, 2);
-  const isUp      = changePct >= 0;
-  const stPct     = r(2.5, 11, 3);
-  const stDollar  = price * stPct / 100;
-  const pct_a     = Math.round(r(8, 92, 4));
-  const pct_b     = Math.round(r(8, 92, 5));
-  const pct_ep    = Math.round(r(8, 92, 6));
-  const sig       = p => p <= 25 ? "CHEAP" : p >= 75 ? "RICH" : "NORMAL";
-  return {
-    name:     sym,
-    price:    `$${price.toFixed(2)}`,
-    change:   `${isUp ? "+" : ""}${changePct.toFixed(2)}%`,
-    dir:      isUp ? "up" : "down",
-    front:    `$${stDollar.toFixed(2)}`,
-    frontPct: `${stPct.toFixed(2)}% of price`,
-    pct_a, pct_b, pct_ep,
-    sig_a: sig(pct_a), sig_b: sig(pct_b), sig_ep: sig(pct_ep),
-  };
-}
-
 const US_HOLIDAYS = new Set([
   "2026-01-01","2026-01-19","2026-02-16","2026-04-03","2026-05-25",
   "2026-07-03","2026-09-07","2026-11-26","2026-12-25",
@@ -99,12 +69,21 @@ function earnBadgeDate(dateStr) {
   return new Date(dateStr + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
-function TickerRow({ sym, onClick, earningsMap }) {
-  const t = dummyTicker(sym);
-  const isUp = t.dir === "up";
+function TickerRow({ sym, onClick, earningsMap, live }) {
   const earnInfo = earningsMap[sym] || null;
   const badge = earnInfo ? earnBadgeDate(earnInfo.date) : null;
   const subLabel = earnInfo ? tradingDaysUntil(earnInfo.date, earnInfo.time) : "Date TBD";
+
+  const hasPrice    = live && live.price != null;
+  const hasChange   = live && live.change_pct != null;
+  const hasStraddle = live && live.straddle_dollar != null && live.straddle_pct != null;
+  const hasPct      = live && live.pct_a != null;
+  const isUp        = hasChange ? live.change_pct >= 0 : null;
+
+  const priceLabel    = hasPrice    ? `$${live.price.toFixed(2)}`                        : "—";
+  const changeLabel   = hasChange   ? `${isUp ? "+" : ""}${live.change_pct.toFixed(2)}%`  : "—";
+  const frontLabel    = hasStraddle ? `$${live.straddle_dollar.toFixed(2)}`               : "—";
+  const frontPctLabel = hasStraddle ? `${(live.straddle_pct * 100).toFixed(2)}% of price` : "Loading…";
 
   return (
     <div onClick={onClick} style={{
@@ -122,25 +101,29 @@ function TickerRow({ sym, onClick, earningsMap }) {
           )}
         </div>
         <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2 }}>{subLabel}</div>
-        <div style={{ marginTop: 6, width: 90 }}>
-          <MiniBar pct={t.pct_a}  sig={t.sig_a}  label="A" />
-          <MiniBar pct={t.pct_b}  sig={t.sig_b}  label="B" />
-          <MiniBar pct={t.pct_ep} sig={t.sig_ep} label="EP" />
-        </div>
+        {hasPct ? (
+          <div style={{ marginTop: 6, width: 90 }}>
+            <MiniBar pct={live.pct_a}  sig={live.signal_a}  label="A" />
+            <MiniBar pct={live.pct_b}  sig={live.signal_b}  label="B" />
+            <MiniBar pct={live.pct_ep} sig={live.signal_ep} label="EP" />
+          </div>
+        ) : (
+          <div style={{ marginTop: 6, fontSize: 10, color: "var(--text4)" }}>Loading percentiles…</div>
+        )}
       </div>
-      <div style={{ textAlign: "right", fontSize: 13, fontWeight: 500, color: "var(--text)" }}>{t.price}</div>
+      <div style={{ textAlign: "right", fontSize: 13, fontWeight: 500, color: "var(--text)" }}>{priceLabel}</div>
       <div style={{ textAlign: "right" }}>
         <span style={{
-          background: isUp ? "var(--up-bg)" : "var(--down-bg)",
-          color: isUp ? "var(--up)" : "var(--down)",
+          background: isUp === null ? "var(--border)" : isUp ? "var(--up-bg)" : "var(--down-bg)",
+          color: isUp === null ? "var(--text3)" : isUp ? "var(--up)" : "var(--down)",
           fontSize: 11, fontWeight: 500, padding: "2px 5px", borderRadius: 4
         }}>
-          {t.change}
+          {changeLabel}
         </span>
       </div>
       <div style={{ textAlign: "right" }}>
-        <div style={{ fontSize: 13, fontWeight: 500, color: "var(--text)" }}>{t.front}</div>
-        <div style={{ fontSize: 10, color: "var(--text3)", marginTop: 1 }}>{t.frontPct}</div>
+        <div style={{ fontSize: 13, fontWeight: 500, color: "var(--text)" }}>{frontLabel}</div>
+        <div style={{ fontSize: 10, color: "var(--text3)", marginTop: 1 }}>{frontPctLabel}</div>
       </div>
     </div>
   );
@@ -169,6 +152,7 @@ export default function WatchlistScreen({ onSelectTicker, onTab, earningsMap }) 
   const [searchQuery, setSearchQuery] = useState("");
   const [allSyms, setAllSyms] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [liveData, setLiveData] = useState({});
 
   useEffect(() => {
     fetch(`${API_BASE}/analysis?dbe=0`)
@@ -178,6 +162,23 @@ export default function WatchlistScreen({ onSelectTicker, onTab, earningsMap }) 
         setLoading(false);
       })
       .catch(() => setLoading(false));
+  }, []);
+
+  // Live price/change/percentile data for every row -- fetched separately
+  // from the ticker list above since it hits Alpaca per ticker and takes
+  // longer; rows render with a "Loading…" state until this resolves, then
+  // re-render once. Refreshed every 60s to match the backend's cache TTL.
+  useEffect(() => {
+    let cancelled = false;
+    const loadLive = () => {
+      fetch(`${API_BASE}/watchlist-live`)
+        .then(r => r.json())
+        .then(d => { if (!cancelled) setLiveData(d.tickers || {}); })
+        .catch(() => {});
+    };
+    loadLive();
+    const interval = setInterval(loadLive, 60000);
+    return () => { cancelled = true; clearInterval(interval); };
   }, []);
 
   const query = searchQuery.trim().toUpperCase();
@@ -263,7 +264,7 @@ export default function WatchlistScreen({ onSelectTicker, onTab, earningsMap }) 
             <>
               <SectionHeader label={`${searchResults.length} result${searchResults.length !== 1 ? "s" : ""}`} />
               {searchResults.map(sym => (
-                <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} />
+                <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} live={liveData[sym]} />
               ))}
             </>
           )
@@ -271,19 +272,19 @@ export default function WatchlistScreen({ onSelectTicker, onTab, earningsMap }) 
           <>
             {thisWeek.length > 0 && (<>
               <SectionHeader label="Earnings This Week" />
-              {thisWeek.map(({ sym }) => <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} />)}
+              {thisWeek.map(({ sym }) => <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} live={liveData[sym]} />)}
             </>)}
             {nextWeek.length > 0 && (<>
               <SectionHeader label="Earnings Next Week" />
-              {nextWeek.map(({ sym }) => <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} />)}
+              {nextWeek.map(({ sym }) => <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} live={liveData[sym]} />)}
             </>)}
             {upcoming.length > 0 && (<>
               <SectionHeader label="Upcoming Earnings" />
-              {upcoming.map(({ sym }) => <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} />)}
+              {upcoming.map(({ sym }) => <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} live={liveData[sym]} />)}
             </>)}
             {noDate.length > 0 && (<>
               <SectionHeader label="Date Not Confirmed" />
-              {noDate.map(({ sym }) => <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} />)}
+              {noDate.map(({ sym }) => <TickerRow key={sym} sym={sym} onClick={() => onSelectTicker(sym)} earningsMap={earningsMap} live={liveData[sym]} />)}
             </>)}
           </>
         )}

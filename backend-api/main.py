@@ -470,6 +470,113 @@ def get_analysis(dbe: int = 0):
     return response
 
 
+# Short-TTL cache for /watchlist-live -- this endpoint fans out to Alpaca for
+# every ticker in the dataset, so a 6-hour cache (like the historical
+# endpoints above) would defeat the point of it being "live," but no cache
+# at all would mean every Watchlist screen open re-fires a live batch quote
+# plus one live option-chain lookup per ticker. 60s keeps repeated opens/
+# re-renders cheap while still refreshing about as often as the 5-minute
+# paper-trading poll.
+WATCHLIST_LIVE_CACHE = {}
+WATCHLIST_LIVE_TTL_SECONDS = 60
+
+
+@app.get("/watchlist-live")
+def get_watchlist_live():
+    """Live price, daily % change, and live-with-historical-fallback
+    percentile signal for every ticker in the dataset -- powers the
+    Watchlist screen's per-row display in place of the old dummyTicker()
+    fabricated placeholder values."""
+    if df_global is None:
+        raise HTTPException(status_code=503, detail="Parquet data not loaded.")
+
+    cached = WATCHLIST_LIVE_CACHE.get("data")
+    if cached and (datetime.now() - cached["timestamp"]) < timedelta(seconds=WATCHLIST_LIVE_TTL_SECONDS):
+        return cached["data"]
+
+    tickers = sorted(df_global["ticker"].unique().tolist())
+
+    # Batch price + previous close for every ticker in as few live calls as
+    # possible (one Alpaca snapshot call per chunk, not one call per ticker).
+    price_data = {}
+    try:
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+        from alpaca.data.requests import StockSnapshotRequest
+        stock_client = StockHistoricalDataClient(paper_trading.ALPACA_API_KEY, paper_trading.ALPACA_SECRET_KEY)
+        CHUNK = 200
+        for i in range(0, len(tickers), CHUNK):
+            chunk = tickers[i:i + CHUNK]
+            try:
+                snaps = stock_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=chunk))
+            except Exception as e:
+                print(f"Watchlist snapshot batch failed for chunk starting {chunk[0]}: {e}")
+                continue
+            for sym, snap in snaps.items():
+                try:
+                    price = float(snap.latest_trade.price)
+                    prev_close = float(snap.previous_daily_bar.close)
+                    change_pct = ((price - prev_close) / prev_close * 100) if prev_close else None
+                    price_data[sym] = {"price": price, "change_pct": change_pct}
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"Watchlist price snapshot fetch failed entirely: {e}")
+
+    # Percentile signal + straddle value per ticker: live quote with a
+    # fallback to the historical calc, same pattern as /straddle/{ticker}.
+    # Run concurrently -- a live option-chain lookup is several sequential
+    # Alpaca calls on its own, and this runs it once per ticker.
+    def compute_one(ticker):
+        try:
+            live = live_quotes.get_live_straddle_inputs(ticker)
+            return get_straddle_percentile_live(
+                df_global, ticker=ticker, dbe=0,
+                live_close_a=live["close_a"], live_close_b=live["close_b"],
+                live_spy_close_a=live["spy_close_a"], live_spy_close_b=live["spy_close_b"],
+            )
+        except Exception:
+            try:
+                return get_straddle_percentile(df_global, ticker=ticker, dbe=0)
+            except Exception:
+                return None
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        futures = {executor.submit(compute_one, t): t for t in tickers}
+        for future in as_completed(futures):
+            ticker = futures[future]
+            try:
+                result = future.result()
+            except Exception as e:
+                print(f"Watchlist live compute failed for {ticker}: {e}")
+                result = None
+            if result is None:
+                continue
+
+            pdata = price_data.get(ticker)
+            price = pdata["price"] if pdata else None
+            change_pct = pdata["change_pct"] if pdata else None
+            straddle_pct = result.get("close_a")  # fraction of stock price, e.g. 0.037
+            straddle_dollar = (straddle_pct * price) if (straddle_pct is not None and price is not None) else None
+
+            results[ticker] = {
+                "price":           price,
+                "change_pct":      change_pct,
+                "straddle_pct":    straddle_pct,
+                "straddle_dollar": straddle_dollar,
+                "pct_a":           result.get("pct_a"),
+                "pct_b":           result.get("pct_b"),
+                "pct_ep":          result.get("pct_ep"),
+                "signal_a":        result.get("signal_a"),
+                "signal_b":        result.get("signal_b"),
+                "signal_ep":       result.get("signal_ep"),
+            }
+
+    response = {"tickers": results, "count": len(results)}
+    WATCHLIST_LIVE_CACHE["data"] = {"data": response, "timestamp": datetime.now()}
+    return response
+
+
 @app.get("/debug/{date_str}")
 def debug_nasdaq(date_str: str):
     url = f"https://api.nasdaq.com/api/calendar/earnings?date={date_str}"

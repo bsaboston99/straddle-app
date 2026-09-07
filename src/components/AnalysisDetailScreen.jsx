@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { API_BASE } from "../data/tickers";
 import TabBar from "./TabBar";
+import { MiniBar, CompositeBadge } from "./MiniBar";
 
 // ── Straddle + move history chart (pure historical, no live data) ──────────
 function HistoryChart({ history }) {
@@ -247,12 +248,28 @@ export default function AnalysisDetailScreen({ ticker, onBack, onTab }) {
   const [loading, setLoading] = useState(true);
   const [error, setError]   = useState(null);
 
+  // Live-now snapshot (Alpaca live quote with a historical fallback baked
+  // in server-side) -- separate from the historical chart/table above,
+  // which is always DBE=0 archive data regardless of this.
+  const [live, setLive]           = useState(null);
+  const [liveLoading, setLiveLoading] = useState(true);
+  const [liveError, setLiveError]     = useState(false);
+
   useEffect(() => {
     setLoading(true);
     fetch(`${API_BASE}/history/${ticker}?dbe=0`)
       .then(r => r.json())
       .then(d => { setHistory(d.data); setLoading(false); })
       .catch(() => { setError("Failed to load history."); setLoading(false); });
+  }, [ticker]);
+
+  useEffect(() => {
+    setLiveLoading(true);
+    setLiveError(false);
+    fetch(`${API_BASE}/straddle/${ticker}?dbe=0`)
+      .then(r => { if (!r.ok) throw new Error("not ok"); return r.json(); })
+      .then(d => { setLive(d); setLiveLoading(false); })
+      .catch(() => { setLiveError(true); setLiveLoading(false); });
   }, [ticker]);
 
   // Sort oldest → newest for the chart; newest → oldest for the table
@@ -275,6 +292,47 @@ export default function AnalysisDetailScreen({ ticker, onBack, onTab }) {
 
       {/* Body */}
       <div style={{ flex: 1, overflowY: "auto" }}>
+
+        {/* Live now */}
+        {liveLoading && (
+          <div style={{ margin: "16px 16px 0", padding: "14px 16px", fontSize: 12, color: "var(--text3)" }}>
+            Loading live data…
+          </div>
+        )}
+        {!liveLoading && liveError && (
+          <div style={{ margin: "16px 16px 0", padding: "14px 16px", fontSize: 12, color: "var(--text3)" }}>
+            Live data unavailable for {ticker} right now.
+          </div>
+        )}
+        {!liveLoading && !liveError && live && (
+          <div style={{ background: "var(--surface)", margin: "16px 16px 0", borderRadius: 10, padding: "14px 16px", border: "0.5px solid var(--border)" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+              <span style={{ fontSize: 11, fontWeight: 500, color: "var(--text2)", textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                Live Now
+              </span>
+              <CompositeBadge composite={live.composite} />
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 12 }}>
+              <div>
+                <div style={{ fontSize: 20, fontWeight: 600, color: "var(--text)" }}>
+                  {(live.close_a * 100).toFixed(2)}%
+                </div>
+                <div style={{ fontSize: 10, color: "var(--text4)" }}>straddle A, of price</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 20, fontWeight: 600, color: "var(--text)" }}>
+                  {live.earnings_premium.toFixed(2)}x
+                </div>
+                <div style={{ fontSize: 10, color: "var(--text4)" }}>earnings premium (B/A)</div>
+              </div>
+            </div>
+            <div style={{ width: 170 }}>
+              <MiniBar pct={live.pct_a}  sig={live.signal_a}  label="A" />
+              <MiniBar pct={live.pct_b}  sig={live.signal_b}  label="B" />
+              <MiniBar pct={live.pct_ep} sig={live.signal_ep} label="EP" />
+            </div>
+          </div>
+        )}
 
         {loading && (
           <div style={{ padding: "60px 20px", textAlign: "center", color: "var(--text3)", fontSize: 13 }}>

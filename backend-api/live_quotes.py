@@ -44,6 +44,18 @@ than assumed:
    rel_straddle_a is "ticker's front-month straddle vs. what SPY's straddle
    costs at that SAME calendar expiration" -- a same-maturity comparison,
    not two independently-chosen tenors.
+
+3. Every straddle value is normalized by ITS OWN underlying's spot price,
+   not a raw dollar mid-price.
+   Confirmed by reading parquetcombine.py's derived-column block:
+   `closestraddle_a = (callclose_a + putclose_a) / stock_close` and
+   `closespystraddle_a = (spycallclose_a + spyputclose_a) / spy_close` --
+   i.e. the ticker's straddle is divided by the TICKER's price, and SPY's
+   straddle is divided by SPY's OWN price (not the ticker's). Passing raw
+   dollar mid-prices instead (an earlier version of this file did exactly
+   that) silently changes the scale of every number fed into
+   get_straddle_percentile_live, since rel_straddle_a is really comparing
+   two already-normalized percentages, not two dollar figures.
 """
 from datetime import date, timedelta
 
@@ -130,7 +142,9 @@ def get_ranked_expirations(ticker: str, num_expirations: int = 2, window_days: i
         best_call, best_put = pair
         call_px = get_latest_option_quote_mid(best_call.symbol)
         put_px = get_latest_option_quote_mid(best_put.symbol)
-        results.append({"straddle": call_px + put_px, "expiration": exp, "dte": (exp - today).days})
+        # Normalized by the ticker's own spot price -- see module docstring point 3.
+        straddle_pct = (call_px + put_px) / stock_price
+        results.append({"straddle": straddle_pct, "expiration": exp, "dte": (exp - today).days})
 
     return results
 
@@ -173,7 +187,8 @@ def get_straddle_at_expiration(symbol: str, expiration: date) -> float:
     best_call, best_put = pair
     call_px = get_latest_option_quote_mid(best_call.symbol)
     put_px = get_latest_option_quote_mid(best_put.symbol)
-    return call_px + put_px
+    # Normalized by this symbol's own spot price -- see module docstring point 3.
+    return (call_px + put_px) / spot_price
 
 
 def get_live_straddle_inputs(ticker: str) -> dict:
