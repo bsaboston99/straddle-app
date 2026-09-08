@@ -506,18 +506,23 @@ WATCHLIST_LIVE_CACHE = {}
 WATCHLIST_LIVE_TTL_SECONDS = 60
 
 # Alpaca throttles the whole account to 200 requests/minute, shared with the
-# paper-trading cron -- not per-endpoint. A live option-chain lookup costs
-# ~5-6 calls (stock price + option chain + up to 4 quotes), so doing that
-# for every ticker in the dataset (100+) would blow well past the limit on
-# a single refresh. Scoping live lookups to tickers with earnings in the
-# next couple weeks keeps this comfortably under budget while still making
-# the numbers live exactly where "live" actually matters -- everything
-# further out (or with no upcoming earnings at all) shows the same
-# historical percentile data the app already had before this feature.
-# MAX_LIVE_TICKERS is an extra hard cap in case an earnings-heavy week
-# still produces more near-term names than that budget comfortably allows.
-WATCHLIST_LIVE_EARNINGS_WEEKS = 2
-MAX_LIVE_TICKERS = 30
+# paper-trading cron -- not per-endpoint, not per-refresh. live_quotes.py
+# batches its option-quote calls and reuses the stock price this endpoint
+# already fetched (see live_quotes.py's module docstring point 4), which
+# brings a near-term ticker's live lookup down to ~2 Alpaca calls (option
+# chain + one batched quote call for all its legs). SPY is memoized across
+# the whole batch on top of that (typically 1-2 real SPY fetches total, not
+# one per ticker). Even at 130+ tickers that's ~260+ calls if EVERY ticker
+# went live -- still over budget in one burst -- so live lookups stay
+# scoped to tickers with near-term earnings (where "live" actually
+# matters); everything else shows the historical percentile data the app
+# already had before this feature. At ~2 calls/ticker, 60 near-term
+# tickers is ~120 calls -- comfortable headroom under 200 for the SPY
+# overhead, the price snapshot call, and anything the trading cron does in
+# the same window. Raise MAX_LIVE_TICKERS if you want to push closer to
+# the ceiling; the real constraint is calls/minute, not a hardcoded count.
+WATCHLIST_LIVE_EARNINGS_WEEKS = 3
+MAX_LIVE_TICKERS = 60
 
 
 @app.get("/watchlist-live")
@@ -605,7 +610,8 @@ def get_watchlist_live():
 
         if ticker in live_tickers:
             try:
-                live = live_quotes.get_live_straddle_inputs(ticker, _spy_cache=spy_cache)
+                known_price = price_data.get(ticker, {}).get("price")
+                live = live_quotes.get_live_straddle_inputs(ticker, _spy_cache=spy_cache, stock_price=known_price)
                 result = get_straddle_percentile_live(
                     ticker_df, ticker=ticker, dbe=0,
                     live_close_a=live["close_a"], live_close_b=live["close_b"],
