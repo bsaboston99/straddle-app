@@ -512,3 +512,44 @@ def export_rows(since: str = None) -> list:
         else:
             cur = conn.execute("SELECT * FROM live_daily ORDER BY date, ticker")
         return [dict(r) for r in cur.fetchall()]
+
+
+def get_status() -> dict:
+    """Lightweight health check: row/date counts, the most recent capture
+    timestamps, and today's per-ticker coverage -- powers
+    /live-archive/status so this can be checked from a browser instead of
+    digging through Render logs."""
+    with get_db() as conn:
+        total_rows = conn.execute("SELECT COUNT(*) AS n FROM live_daily").fetchone()["n"]
+        distinct_dates = conn.execute("SELECT COUNT(DISTINCT date) AS n FROM live_daily").fetchone()["n"]
+        earliest_date = conn.execute("SELECT MIN(date) AS d FROM live_daily").fetchone()["d"]
+        latest_date = conn.execute("SELECT MAX(date) AS d FROM live_daily").fetchone()["d"]
+        last_open_at = conn.execute("SELECT MAX(captured_open_at) AS t FROM live_daily").fetchone()["t"]
+        last_close_at = conn.execute("SELECT MAX(captured_close_at) AS t FROM live_daily").fetchone()["t"]
+
+        today = date.today().isoformat()
+        today_rows = [dict(r) for r in conn.execute(
+            "SELECT ticker, stock_open, stock_close, callsym_a, captured_open_at, captured_close_at "
+            "FROM live_daily WHERE date = ? ORDER BY ticker",
+            (today,),
+        )]
+
+    today_summary = {
+        "date": today,
+        "tickers_captured": len(today_rows),
+        "with_open": sum(1 for r in today_rows if r["stock_open"] is not None),
+        "with_close": sum(1 for r in today_rows if r["stock_close"] is not None),
+        "missing_legs": sorted(r["ticker"] for r in today_rows if r["callsym_a"] is None),
+    }
+
+    return {
+        "db_path": str(DB_PATH),
+        "db_exists": DB_PATH.exists(),
+        "total_rows": total_rows,
+        "distinct_dates": distinct_dates,
+        "earliest_date": earliest_date,
+        "latest_date": latest_date,
+        "last_capture_open_at": last_open_at,
+        "last_capture_close_at": last_close_at,
+        "today": today_summary,
+    }
