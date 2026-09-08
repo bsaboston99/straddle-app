@@ -21,11 +21,6 @@ services:
         value: https://paper-api.alpaca.markets
       - key: PAPER_TRADING_DB
         value: /var/data/paper_trading.db
-      - key: LIVE_ARCHIVE_DB
-        # Same persistent disk as PAPER_TRADING_DB above, but a distinct
-        # file -- the live-observed archive is kept entirely separate
-        # from the trade ledger (see live_archive.py's module docstring).
-        value: /var/data/live_archive.db
     disk:
       # Fixes the ephemeral-disk risk noted in paper_trading.py: without
       # this, a redeploy or restart of insignia-api wipes the trade ledger,
@@ -81,30 +76,3 @@ services:
     buildCommand: pip install requests
     schedule: "*/5 * * * 1-5"
     startCommand: python -c "import requests; requests.post('https://insignia-api-qkex.onrender.com/paper-trading/run-daily-check')"
-
-  # -- Live-archive capture: market open ---------------------------------------
-  # Snapshots every watchlist ticker's live stock + option quotes shortly
-  # after the open into live_archive.py's SQLite table -- entirely separate
-  # storage from combined_daily and from paper_trading.db (see that
-  # module's docstring). Same cron-just-POSTs pattern as the two crons
-  # above; the real work runs in insignia-api. Fixed UTC-5, same DST
-  # caveat as insignia-alerts above -- this will drift an hour during EDT.
-  - type: cron
-    name: insignia-live-archive-open
-    runtime: python
-    rootDir: backend-api
-    buildCommand: pip install requests
-    schedule: "35 14 * * 1-5"  # 9:35am ET (UTC-5)
-    startCommand: python -c "import requests; requests.post('https://insignia-api-qkex.onrender.com/live-archive/capture-open')"
-
-  # -- Live-archive capture: market close --------------------------------------
-  # Re-quotes the same contracts capture-open already picked for today (no
-  # second contracts lookup needed -- see live_archive.py) shortly before
-  # the close.
-  - type: cron
-    name: insignia-live-archive-close
-    runtime: python
-    rootDir: backend-api
-    buildCommand: pip install requests
-    schedule: "58 20 * * 1-5"  # 3:58pm ET (UTC-5)
-    startCommand: python -c "import requests; requests.post('https://insignia-api-qkex.onrender.com/live-archive/capture-close')"
