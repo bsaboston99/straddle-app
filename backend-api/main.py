@@ -723,14 +723,6 @@ def live_archive_export(since: str = None):
     return {"rows": live_archive.export_rows(since)}
 
 
-@app.get("/live-archive/status")
-def live_archive_status():
-    """Quick health check for the archive -- row/date counts, last
-    capture timestamps, today's per-ticker coverage -- so this can be
-    sanity-checked from a browser instead of digging through Render logs."""
-    return live_archive.get_status()
-
-
 @app.get("/debug/{date_str}")
 def debug_nasdaq(date_str: str):
     url = f"https://api.nasdaq.com/api/calendar/earnings?date={date_str}"
