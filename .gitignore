@@ -37,3 +37,4 @@ dist-ssr
 
 # Paper trading runtime database (dev-machine test data, not part of the deploy state)
 backend-api/data/paper_trading.db
+backend-api/data/live_archive.db

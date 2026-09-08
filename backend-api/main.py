@@ -12,6 +12,7 @@ from pathlib import Path
 from straddle_analysis import load_all_data, add_relative_straddles, get_straddle_percentile, get_straddle_percentile_live
 import paper_trading
 import live_quotes
+import live_archive
 
 app = FastAPI()
 
@@ -34,6 +35,12 @@ df_global = None
 # over many tickers (like /watchlist-live) filter/copy from this instead of
 # re-scanning the full 80k+-row df_global once per ticker.
 TICKER_GROUPS = {}
+
+# Set while a /live-archive capture is running so _prewarm_watchlist_live
+# skips a cycle instead of doubling up on Alpaca calls in the same
+# 60-second window -- these two features don't share any code path, but
+# they do share the 200-req/min account-wide rate limit.
+ARCHIVE_CAPTURE_IN_PROGRESS = False
 
 FEATHER_CACHE = Path(__file__).parent / "df_cache.feather"
 
@@ -90,6 +97,11 @@ async def startup_event():
     except Exception as e:
         print(f"WARNING: Could not init paper trading db: {e}")
 
+    try:
+        live_archive.init_db()
+    except Exception as e:
+        print(f"WARNING: Could not init live archive db: {e}")
+
     # Pre-warm earnings cache in background so first user doesn't wait
     asyncio.create_task(_prewarm_earnings())
 
@@ -108,11 +120,14 @@ async def _prewarm_watchlist_live():
     await asyncio.sleep(5)  # let df_global/earnings pre-warm settle first
     loop = asyncio.get_event_loop()
     while True:
-        try:
-            await loop.run_in_executor(None, get_watchlist_live)
-            print("Watchlist live pre-warm complete.")
-        except Exception as e:
-            print(f"Watchlist live pre-warm failed: {e}")
+        if ARCHIVE_CAPTURE_IN_PROGRESS:
+            print("Watchlist live pre-warm skipped -- a live-archive capture is running.")
+        else:
+            try:
+                await loop.run_in_executor(None, get_watchlist_live)
+                print("Watchlist live pre-warm complete.")
+            except Exception as e:
+                print(f"Watchlist live pre-warm failed: {e}")
         # Refresh a few seconds before the cache would otherwise expire, so
         # there's effectively never a cold cache for a real request to hit.
         await asyncio.sleep(max(WATCHLIST_LIVE_TTL_SECONDS - 5, 5))
@@ -663,6 +678,49 @@ def get_watchlist_live():
     response = {"tickers": results, "count": len(results)}
     WATCHLIST_LIVE_CACHE["data"] = {"data": response, "timestamp": datetime.now()}
     return response
+
+
+# -- Live-observed daily archive ---------------------------------------------
+# Captures Alpaca's live quotes into a small archive shaped like
+# combined_daily -- entirely separate storage from both df_global/
+# COMBINED_DIR and paper_trading.db, see live_archive.py's module
+# docstring. Triggered by two Render crons (market open / market close,
+# see render.yaml) the same way /alerts/trigger and
+# /paper-trading/run-daily-check already are: the cron just POSTs, all the
+# real work runs here in insignia-api.
+
+@app.post("/live-archive/capture-open")
+def live_archive_capture_open():
+    global ARCHIVE_CAPTURE_IN_PROGRESS
+    if df_global is None:
+        raise HTTPException(status_code=503, detail="Parquet data not loaded.")
+    tickers = sorted(df_global["ticker"].unique().tolist())
+    ARCHIVE_CAPTURE_IN_PROGRESS = True
+    try:
+        return live_archive.capture_open(tickers, get_earnings)
+    finally:
+        ARCHIVE_CAPTURE_IN_PROGRESS = False
+
+
+@app.post("/live-archive/capture-close")
+def live_archive_capture_close():
+    global ARCHIVE_CAPTURE_IN_PROGRESS
+    if df_global is None:
+        raise HTTPException(status_code=503, detail="Parquet data not loaded.")
+    tickers = sorted(df_global["ticker"].unique().tolist())
+    ARCHIVE_CAPTURE_IN_PROGRESS = True
+    try:
+        return live_archive.capture_close(tickers, get_earnings)
+    finally:
+        ARCHIVE_CAPTURE_IN_PROGRESS = False
+
+
+@app.get("/live-archive/export")
+def live_archive_export(since: str = None):
+    """Pulled by the user's local Code/sync_live_archive.py -- never by
+    the frontend. `since` (YYYY-MM-DD) limits to rows captured on or after
+    that date."""
+    return {"rows": live_archive.export_rows(since)}
 
 
 @app.get("/debug/{date_str}")
