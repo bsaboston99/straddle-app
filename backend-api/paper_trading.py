@@ -253,21 +253,51 @@ def get_open_positions():
         return [dict(r) for r in rows]
 
 
+def _previous_option_closes(option_symbols: list) -> dict:
+    """Yesterday's (or the most recent completed session's) closing price
+    per option symbol, straight from Alpaca's historical option BARS
+    endpoint -- get_option_bars, distinct from get_option_latest_quote/
+    get_option_snapshot. OptionsSnapshot has no previous-close field the
+    way a stock Snapshot does, but the bars endpoint answers "what did
+    this contract close at on its last session" directly, on demand, with
+    no local storage needed. A symbol is simply absent from the result if
+    its most recent session had no trades at all (can happen for a
+    less-liquid near-the-money contract) or the request fails."""
+    if not option_symbols:
+        return {}
+    from alpaca.data.requests import OptionBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    client = get_option_data_client()
+    today = date.today()
+    req = OptionBarsRequest(
+        symbol_or_symbols=option_symbols,
+        timeframe=TimeFrame.Day,
+        start=datetime.combine(today - timedelta(days=10), datetime.min.time()),  # covers weekends/holidays
+    )
+    try:
+        bar_set = client.get_option_bars(req)
+    except Exception as e:
+        print(f"Live position pricing: previous-close option bars failed: {e}")
+        return {}
+
+    result = {}
+    for sym, bars in (bar_set.data or {}).items():
+        prior = [b for b in bars if b.timestamp.date() < today]
+        if prior:
+            result[sym] = float(max(prior, key=lambda b: b.timestamp).close)
+    return result
+
+
 def enrich_positions_live(positions: list) -> list:
     """Adds a live mark to each open position: current_straddle_price /
     current_value_usd (live call+put mid quotes, same per-contract-pair
     units as entry_cost -- see the qty*100 comment at place_straddle_entry
-    for why *100), unrealized_pnl_pct/usd against entry_cost, and the
-    underlying's own stock_price/stock_change_pct.
-
-    stock_change_pct is the closest honest "daily change" available for a
-    position: Alpaca's OptionsSnapshot (latest_trade/latest_quote/
-    implied_volatility/greeks only) has no previous_daily_bar the way its
-    stock Snapshot does, so there's no live source for how much THIS
-    position's own value moved since yesterday's close without storing a
-    daily snapshot ourselves, which is deliberately out of scope. The
-    underlying's move is shown instead, labeled as the ticker's move, not
-    implied to be the position's own change.
+    for why *100), unrealized_pnl_pct/usd against entry_cost,
+    position_change_pct/usd (this position's OWN change since its most
+    recent completed session, via _previous_option_closes -- see that
+    function's docstring for how this gets around OptionsSnapshot not
+    having a previous-close field), and the underlying's own
+    stock_price/stock_change_pct as a secondary reference point.
 
     Never raises -- a batch failure just means the affected fields are
     left out of the returned dicts, so the caller can still show the
@@ -296,12 +326,13 @@ def enrich_positions_live(positions: list) -> list:
     except Exception as e:
         print(f"Live position pricing: stock snapshot failed: {e}")
 
+    option_symbols = list(dict.fromkeys(
+        sym for p in enriched for sym in (p["call_symbol"], p["put_symbol"]) if sym
+    ))
+
     option_mids = {}
     try:
         from alpaca.data.requests import OptionLatestQuoteRequest
-        option_symbols = list(dict.fromkeys(
-            sym for p in enriched for sym in (p["call_symbol"], p["put_symbol"]) if sym
-        ))
         if option_symbols:
             quote_client = get_option_data_client()
             quotes = quote_client.get_option_latest_quote(OptionLatestQuoteRequest(symbol_or_symbols=option_symbols))
@@ -310,6 +341,8 @@ def enrich_positions_live(positions: list) -> list:
                 option_mids[sym] = (bid + ask) / 2 if (bid > 0 and ask > 0) else (ask or bid)
     except Exception as e:
         print(f"Live position pricing: option quote batch failed: {e}")
+
+    prev_closes = _previous_option_closes(option_symbols)
 
     now_iso = datetime.now().isoformat()
     for row in enriched:
@@ -324,6 +357,14 @@ def enrich_positions_live(positions: list) -> list:
             if entry_cost:
                 row["unrealized_pnl_pct"] = (current_straddle_price - entry_cost) / entry_cost * 100
                 row["unrealized_pnl_usd"] = (current_straddle_price - entry_cost) * qty * 100
+
+            call_prev = prev_closes.get(row.get("call_symbol"))
+            put_prev = prev_closes.get(row.get("put_symbol"))
+            if call_prev is not None and put_prev is not None:
+                prev_straddle_price = call_prev + put_prev
+                if prev_straddle_price:
+                    row["position_change_pct"] = (current_straddle_price - prev_straddle_price) / prev_straddle_price * 100
+                    row["position_change_usd"] = (current_straddle_price - prev_straddle_price) * qty * 100
 
         sdata = stock_prices.get(row["ticker"])
         if sdata:

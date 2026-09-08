@@ -854,11 +854,11 @@ def paper_trading_positions():
 @app.get("/paper-trading/positions-live")
 def paper_trading_positions_live():
     """Open positions enriched with a live mark -- current estimated
-    value, unrealized P&L, and the underlying's daily % change -- powers
-    the Paper Trading screen. See paper_trading.enrich_positions_live for
-    why "daily change" is the underlying's move, not the position's own
-    (Alpaca's option snapshots don't carry a previous close the way stock
-    snapshots do)."""
+    value, unrealized P&L vs. entry, this position's own day-over-day
+    change (via Alpaca's historical option bars, not its snapshot -- see
+    paper_trading.enrich_positions_live / _previous_option_closes), and
+    the underlying's daily % change as secondary context -- powers the
+    Paper Trading screen."""
     try:
         positions = paper_trading.get_open_positions()
     except Exception as e:

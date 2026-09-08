@@ -58,6 +58,24 @@ function ChangeLabel({ ticker, pct }) {
   );
 }
 
+// Prefers the position's OWN day-over-day change (real, from Alpaca's
+// historical option bars) -- falls back to the underlying's move only
+// when that isn't available yet (e.g. a just-entered position with no
+// prior session to diff against, or a quiet contract with no trades on
+// its last session).
+function TodayChange({ p }) {
+  if (p.position_change_pct != null) {
+    const pct = p.position_change_pct;
+    const isUp = pct > 0;
+    return (
+      <div style={{ fontSize: 11, fontWeight: 600, fontVariantNumeric: "tabular-nums", color: isUp ? "var(--up)" : pct < 0 ? "var(--down)" : "var(--text4)", marginTop: 2 }}>
+        {isUp ? "+" : ""}{pct.toFixed(1)}% today
+      </div>
+    );
+  }
+  return <ChangeLabel ticker={p.ticker} pct={p.stock_change_pct} />;
+}
+
 // Live positions refresh on their own timer -- separate from the one-time
 // summary/trade-history load, so opening the screen doesn't wait on an
 // Alpaca round trip, and the estimated value stays reasonably current
@@ -170,7 +188,7 @@ export default function PaperTradingScreen({ onTab }) {
                     {hasLive && p.unrealized_pnl_pct != null && (
                       <div style={{ marginTop: 2 }}><PnlBadge pct={p.unrealized_pnl_pct} /></div>
                     )}
-                    <ChangeLabel ticker={p.ticker} pct={p.stock_change_pct} />
+                    <TodayChange p={p} />
                     <div style={{ fontSize: 10, color: "var(--text4)", marginTop: 2 }}>
                       predicted +{(p.predicted_log_ratio * 100).toFixed(0)}%
                     </div>
