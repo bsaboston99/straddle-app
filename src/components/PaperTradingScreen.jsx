@@ -7,6 +7,25 @@ function formatDate(dateStr) {
   return new Date(dateStr + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+function formatTime(isoStr) {
+  if (!isoStr) return null;
+  try {
+    return new Date(isoStr).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  } catch {
+    return null;
+  }
+}
+
+function formatMoney(n) {
+  if (n === null || n === undefined) return "—";
+  return `$${n.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
+}
+
+function formatPrice(n) {
+  if (n === null || n === undefined) return "—";
+  return `$${n.toFixed(2)}`;
+}
+
 function StatTile({ label, value, color }) {
   return (
     <div style={{ flex: 1, padding: "12px 10px", background: "var(--surface)", borderRadius: 10, border: "0.5px solid var(--border)" }}>
@@ -29,6 +48,22 @@ function PnlBadge({ pct }) {
   );
 }
 
+function ChangeLabel({ ticker, pct }) {
+  if (pct === null || pct === undefined) return null;
+  const isUp = pct > 0;
+  return (
+    <div style={{ fontSize: 10, color: isUp ? "var(--up)" : pct < 0 ? "var(--down)" : "var(--text4)", marginTop: 2 }}>
+      {ticker} {isUp ? "+" : ""}{pct.toFixed(1)}% today
+    </div>
+  );
+}
+
+// Live positions refresh on their own timer -- separate from the one-time
+// summary/trade-history load, so opening the screen doesn't wait on an
+// Alpaca round trip, and the estimated value stays reasonably current
+// while the screen is open.
+const POSITIONS_LIVE_POLL_MS = 60000;
+
 export default function PaperTradingScreen({ onTab }) {
   const [summary, setSummary] = useState(null);
   const [positions, setPositions] = useState([]);
@@ -41,7 +76,7 @@ export default function PaperTradingScreen({ onTab }) {
     setError(null);
     Promise.all([
       fetch(`${API_BASE}/paper-trading/summary`).then(r => r.json()),
-      fetch(`${API_BASE}/paper-trading/positions`).then(r => r.json()),
+      fetch(`${API_BASE}/paper-trading/positions-live`).then(r => r.json()),
       fetch(`${API_BASE}/paper-trading/trades`).then(r => r.json()),
     ])
       .then(([summaryData, positionsData, tradesData]) => {
@@ -54,6 +89,16 @@ export default function PaperTradingScreen({ onTab }) {
         setError("Unable to load paper trading data. Try again shortly.");
         setLoading(false);
       });
+  }, []);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      fetch(`${API_BASE}/paper-trading/positions-live`)
+        .then(r => r.json())
+        .then(d => setPositions(d.positions || []))
+        .catch(() => {}); // keep showing the last good values on a transient failure
+    }, POSITIONS_LIVE_POLL_MS);
+    return () => clearInterval(interval);
   }, []);
 
   const closedTrades = trades.filter(t => t.status === "closed");
@@ -104,41 +149,58 @@ export default function PaperTradingScreen({ onTab }) {
             </div>
             {positions.length === 0 ? (
               <div style={{ padding: "0 20px 8px", fontSize: 12, color: "var(--text3)" }}>No open positions right now.</div>
-            ) : positions.map(p => (
-              <div key={p.id} style={{ display: "flex", alignItems: "center", padding: "12px 20px", borderBottom: "0.5px solid var(--border)", gap: 10 }}>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 15, fontWeight: 500, color: "var(--text)" }}>{p.ticker}</div>
-                  <div style={{ fontSize: 11, color: "var(--text3)" }}>
-                    Entered {formatDate(p.entry_date)} · earnings {formatDate(p.er_date)}
+            ) : positions.map(p => {
+              const entryTime = formatTime(p.entry_time);
+              const hasLive = p.current_value_usd != null;
+              return (
+                <div key={p.id} style={{ display: "flex", alignItems: "flex-start", padding: "12px 20px", borderBottom: "0.5px solid var(--border)", gap: 10 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 15, fontWeight: 500, color: "var(--text)" }}>{p.ticker}</div>
+                    <div style={{ fontSize: 11, color: "var(--text3)" }}>
+                      Entered {formatDate(p.entry_date)}{entryTime ? ` at ${entryTime}` : ""} · earnings {formatDate(p.er_date)}
+                    </div>
+                    <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2, fontVariantNumeric: "tabular-nums" }}>
+                      Entry {formatPrice(p.entry_cost)}{hasLive ? ` → now ${formatPrice(p.current_straddle_price)}` : ""}
+                    </div>
+                  </div>
+                  <div style={{ textAlign: "right" }}>
+                    <div style={{ fontSize: 12, color: "var(--text2)", fontVariantNumeric: "tabular-nums" }}>
+                      {hasLive ? formatMoney(p.current_value_usd) : formatMoney(p.position_size_usd)}
+                    </div>
+                    {hasLive && p.unrealized_pnl_pct != null && (
+                      <div style={{ marginTop: 2 }}><PnlBadge pct={p.unrealized_pnl_pct} /></div>
+                    )}
+                    <ChangeLabel ticker={p.ticker} pct={p.stock_change_pct} />
+                    <div style={{ fontSize: 10, color: "var(--text4)", marginTop: 2 }}>
+                      predicted +{(p.predicted_log_ratio * 100).toFixed(0)}%
+                    </div>
                   </div>
                 </div>
-                <div style={{ textAlign: "right" }}>
-                  <div style={{ fontSize: 12, color: "var(--text2)", fontVariantNumeric: "tabular-nums" }}>
-                    ${p.position_size_usd?.toLocaleString(undefined, { maximumFractionDigits: 0 })}
-                  </div>
-                  <div style={{ fontSize: 10, color: "var(--text4)" }}>
-                    predicted +{(p.predicted_log_ratio * 100).toFixed(0)}%
-                  </div>
-                </div>
-              </div>
-            ))}
+              );
+            })}
 
             <div style={{ padding: "18px 20px 6px", fontSize: 13, fontWeight: 600, color: "var(--text)" }}>
               Trade History
             </div>
             {closedTrades.length === 0 ? (
               <div style={{ padding: "0 20px 8px", fontSize: 12, color: "var(--text3)" }}>No closed trades yet.</div>
-            ) : closedTrades.map(t => (
-              <div key={t.id} style={{ display: "flex", alignItems: "center", padding: "12px 20px", borderBottom: "0.5px solid var(--border)", gap: 10 }}>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 15, fontWeight: 500, color: "var(--text)" }}>{t.ticker}</div>
-                  <div style={{ fontSize: 11, color: "var(--text3)" }}>
-                    {formatDate(t.entry_date)} → {formatDate(t.exit_date)}
+            ) : closedTrades.map(t => {
+              const entryTime = formatTime(t.entry_time);
+              return (
+                <div key={t.id} style={{ display: "flex", alignItems: "flex-start", padding: "12px 20px", borderBottom: "0.5px solid var(--border)", gap: 10 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 15, fontWeight: 500, color: "var(--text)" }}>{t.ticker}</div>
+                    <div style={{ fontSize: 11, color: "var(--text3)" }}>
+                      {formatDate(t.entry_date)}{entryTime ? ` ${entryTime}` : ""} → {formatDate(t.exit_date)}
+                    </div>
+                    <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2, fontVariantNumeric: "tabular-nums" }}>
+                      Entry {formatPrice(t.entry_cost)} → exit {formatPrice(t.exit_value)}
+                    </div>
                   </div>
+                  <PnlBadge pct={t.pnl_pct} />
                 </div>
-                <PnlBadge pct={t.pnl_pct} />
-              </div>
-            ))}
+              );
+            })}
           </>
         )}
       </div>

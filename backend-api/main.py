@@ -273,6 +273,34 @@ def get_earnings(universe: str = "all", weeks: int = 4):
     save_earnings_to_disk(response)
     return response
 
+def _confirmed_earnings_map(universe: str = "all", weeks: int = 8) -> dict:
+    """{ticker: (er_date_str, er_time)} for each ticker's soonest upcoming
+    CONFIRMED earnings print within `weeks` -- confirmed meaning NASDAQ's
+    calendar reports an actual pre-market ("BMO") or after-hours ("AMC")
+    session, not its "time-not-supplied" placeholder (mapped to "TBD" by
+    fetch_nasdaq_earnings above) for a date that hasn't been locked in yet.
+    Live expiration selection is anchored to this date (see live_quotes.py
+    point 5), so a ticker without a confirmed date can't be handled live
+    at all -- it's simply left out of this map, and callers fall back to
+    the historical calc for it, same as any other live-fetch failure."""
+    lookup = {}
+    try:
+        resp = get_earnings(universe=universe, weeks=weeks)
+        dated = []
+        for date_str, items in resp.get("grouped", {}).items():
+            for item in items:
+                if item.get("time") not in ("BMO", "AMC"):
+                    continue
+                dated.append((date_str, item["ticker"], item["time"]))
+        dated.sort(key=lambda x: x[0])
+        for d, t, tm in dated:
+            if t not in lookup:
+                lookup[t] = (d, tm)
+    except Exception as e:
+        print(f"Confirmed-earnings lookup failed, no tickers will get live data: {e}")
+    return lookup
+
+
 @app.get("/straddle/{ticker}")
 def get_straddle(ticker: str, dbe: int = 0):
     if df_global is None:
@@ -286,10 +314,13 @@ def get_straddle(ticker: str, dbe: int = 0):
 
     try:
         live = None
-        try:
-            live = live_quotes.get_live_straddle_inputs(sym)
-        except Exception as e:
-            print(f"Live quote fetch failed for {sym}, falling back to historical: {e}")
+        confirmed = _confirmed_earnings_map().get(sym)
+        if confirmed:
+            er_date, er_time = confirmed
+            try:
+                live = live_quotes.get_live_straddle_inputs(sym, er_date, er_time)
+            except Exception as e:
+                print(f"Live quote fetch failed for {sym}, falling back to historical: {e}")
 
         if live:
             result = get_straddle_percentile_live(
@@ -543,26 +574,15 @@ def get_watchlist_live():
 
     tickers = sorted(df_global["ticker"].unique().tolist())
 
-    # Which tickers actually need a live option-chain lookup: those with
-    # earnings in the next WATCHLIST_LIVE_EARNINGS_WEEKS weeks, soonest
-    # first, capped at MAX_LIVE_TICKERS. Reuses the same NASDAQ earnings
-    # calendar /paper-trading/run-daily-check already pulls from.
-    live_tickers = set()
-    try:
-        earnings_resp = get_earnings(universe="all", weeks=WATCHLIST_LIVE_EARNINGS_WEEKS)
-        dated = []
-        for date_str, items in earnings_resp.get("grouped", {}).items():
-            for item in items:
-                dated.append((date_str, item["ticker"]))
-        dated.sort(key=lambda x: x[0])
-        for _, tkr in dated:
-            if tkr in live_tickers:
-                continue
-            live_tickers.add(tkr)
-            if len(live_tickers) >= MAX_LIVE_TICKERS:
-                break
-    except Exception as e:
-        print(f"Watchlist near-term earnings lookup failed, no tickers will get live percentile data: {e}")
+    # Which tickers actually need a live option-chain lookup: those with a
+    # CONFIRMED earnings date (see _confirmed_earnings_map) in the next
+    # WATCHLIST_LIVE_EARNINGS_WEEKS weeks, soonest first, capped at
+    # MAX_LIVE_TICKERS. A ticker with only an unconfirmed/estimated date
+    # can't be anchored to an expiration (live_quotes.py point 5) and
+    # wouldn't produce a trustworthy result anyway, so it's excluded here
+    # rather than attempted and left to fail -- this also means fewer
+    # doomed Alpaca calls than the old "any near-term date" scoping.
+    live_tickers = dict(list(_confirmed_earnings_map(weeks=WATCHLIST_LIVE_EARNINGS_WEEKS).items())[:MAX_LIVE_TICKERS])
 
     # Batch price + previous close for every ticker in as few live calls as
     # possible (one Alpaca snapshot call per chunk of 200, not one call per
@@ -610,8 +630,11 @@ def get_watchlist_live():
 
         if ticker in live_tickers:
             try:
+                er_date, er_time = live_tickers[ticker]
                 known_price = price_data.get(ticker, {}).get("price")
-                live = live_quotes.get_live_straddle_inputs(ticker, _spy_cache=spy_cache, stock_price=known_price)
+                live = live_quotes.get_live_straddle_inputs(
+                    ticker, er_date, er_time, _spy_cache=spy_cache, stock_price=known_price
+                )
                 result = get_straddle_percentile_live(
                     ticker_df, ticker=ticker, dbe=0,
                     live_close_a=live["close_a"], live_close_b=live["close_b"],
@@ -765,13 +788,17 @@ def trigger_alerts():
         return {"status": "no subscribers"}
 
     triggered = []
+    confirmed_map = _confirmed_earnings_map()
     for sym in WATCHLIST:
         try:
             live = None
-            try:
-                live = live_quotes.get_live_straddle_inputs(sym)
-            except Exception as e:
-                print(f"Live quote fetch failed for {sym}: {e}")
+            confirmed = confirmed_map.get(sym)
+            if confirmed:
+                er_date, er_time = confirmed
+                try:
+                    live = live_quotes.get_live_straddle_inputs(sym, er_date, er_time)
+                except Exception as e:
+                    print(f"Live quote fetch failed for {sym}: {e}")
 
             if live:
                 result = get_straddle_percentile_live(
@@ -822,6 +849,25 @@ def paper_trading_positions():
         return {"positions": paper_trading.get_open_positions()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/paper-trading/positions-live")
+def paper_trading_positions_live():
+    """Open positions enriched with a live mark -- current estimated
+    value, unrealized P&L, and the underlying's daily % change -- powers
+    the Paper Trading screen. See paper_trading.enrich_positions_live for
+    why "daily change" is the underlying's move, not the position's own
+    (Alpaca's option snapshots don't carry a previous close the way stock
+    snapshots do)."""
+    try:
+        positions = paper_trading.get_open_positions()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    try:
+        positions = paper_trading.enrich_positions_live(positions)
+    except Exception as e:
+        print(f"Live position enrichment failed, returning static fields only: {e}")
+    return {"positions": positions}
 
 
 @app.get("/paper-trading/signals")

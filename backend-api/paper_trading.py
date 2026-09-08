@@ -183,6 +183,7 @@ def init_db():
             ("entry_rel_straddle_a", "REAL"),
             ("target_rel_straddle_a", "REAL"),
             ("qty", "INTEGER"),
+            ("entry_time", "TEXT"),  # full timestamp; entry_date above is date-only
         ]:
             try:
                 conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {coltype}")
@@ -213,12 +214,13 @@ def record_trade_entry(ticker, er_date, call_symbol, put_symbol, predicted_log_r
                         position_size_usd, entry_cost, order_id, entry_rel_straddle_a=None,
                         target_rel_straddle_a=None, qty=1, notes=""):
     with get_db() as conn:
+        now = datetime.now()
         conn.execute(
-            "INSERT INTO trades (ticker, er_date, entry_date, call_symbol, put_symbol, "
+            "INSERT INTO trades (ticker, er_date, entry_date, entry_time, call_symbol, put_symbol, "
             "predicted_log_ratio, position_size_usd, entry_cost, status, alpaca_entry_order_id, "
             "entry_rel_straddle_a, target_rel_straddle_a, qty, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
-            (ticker, er_date, date.today().isoformat(), call_symbol, put_symbol,
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
+            (ticker, er_date, now.date().isoformat(), now.isoformat(), call_symbol, put_symbol,
              predicted_log_ratio, position_size_usd, entry_cost, order_id,
              entry_rel_straddle_a, target_rel_straddle_a, qty, notes),
         )
@@ -249,6 +251,88 @@ def get_open_positions():
     with get_db() as conn:
         rows = conn.execute("SELECT * FROM trades WHERE status = 'open' ORDER BY entry_date DESC").fetchall()
         return [dict(r) for r in rows]
+
+
+def enrich_positions_live(positions: list) -> list:
+    """Adds a live mark to each open position: current_straddle_price /
+    current_value_usd (live call+put mid quotes, same per-contract-pair
+    units as entry_cost -- see the qty*100 comment at place_straddle_entry
+    for why *100), unrealized_pnl_pct/usd against entry_cost, and the
+    underlying's own stock_price/stock_change_pct.
+
+    stock_change_pct is the closest honest "daily change" available for a
+    position: Alpaca's OptionsSnapshot (latest_trade/latest_quote/
+    implied_volatility/greeks only) has no previous_daily_bar the way its
+    stock Snapshot does, so there's no live source for how much THIS
+    position's own value moved since yesterday's close without storing a
+    daily snapshot ourselves, which is deliberately out of scope. The
+    underlying's move is shown instead, labeled as the ticker's move, not
+    implied to be the position's own change.
+
+    Never raises -- a batch failure just means the affected fields are
+    left out of the returned dicts, so the caller can still show the
+    static (entry-time) fields.
+    """
+    if not positions:
+        return []
+
+    enriched = [dict(p) for p in positions]
+
+    tickers = list(dict.fromkeys(p["ticker"] for p in enriched))
+    stock_prices = {}
+    try:
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+        from alpaca.data.requests import StockSnapshotRequest
+        stock_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        snaps = stock_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=tickers))
+        for sym, snap in snaps.items():
+            try:
+                price = float(snap.latest_trade.price)
+                prev_close = float(snap.previous_daily_bar.close)
+                change_pct = ((price - prev_close) / prev_close * 100) if prev_close else None
+                stock_prices[sym] = {"price": price, "change_pct": change_pct}
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"Live position pricing: stock snapshot failed: {e}")
+
+    option_mids = {}
+    try:
+        from alpaca.data.requests import OptionLatestQuoteRequest
+        option_symbols = list(dict.fromkeys(
+            sym for p in enriched for sym in (p["call_symbol"], p["put_symbol"]) if sym
+        ))
+        if option_symbols:
+            quote_client = get_option_data_client()
+            quotes = quote_client.get_option_latest_quote(OptionLatestQuoteRequest(symbol_or_symbols=option_symbols))
+            for sym, q in quotes.items():
+                bid, ask = float(q.bid_price), float(q.ask_price)
+                option_mids[sym] = (bid + ask) / 2 if (bid > 0 and ask > 0) else (ask or bid)
+    except Exception as e:
+        print(f"Live position pricing: option quote batch failed: {e}")
+
+    now_iso = datetime.now().isoformat()
+    for row in enriched:
+        call_mid = option_mids.get(row.get("call_symbol"))
+        put_mid = option_mids.get(row.get("put_symbol"))
+        if call_mid is not None and put_mid is not None:
+            current_straddle_price = call_mid + put_mid
+            qty = row.get("qty") or 1
+            row["current_straddle_price"] = current_straddle_price
+            row["current_value_usd"] = current_straddle_price * qty * 100
+            entry_cost = row.get("entry_cost")
+            if entry_cost:
+                row["unrealized_pnl_pct"] = (current_straddle_price - entry_cost) / entry_cost * 100
+                row["unrealized_pnl_usd"] = (current_straddle_price - entry_cost) * qty * 100
+
+        sdata = stock_prices.get(row["ticker"])
+        if sdata:
+            row["stock_price"] = sdata["price"]
+            row["stock_change_pct"] = sdata["change_pct"]
+
+        row["live_as_of"] = now_iso
+
+    return enriched
 
 
 def get_recent_signals(limit=200):
