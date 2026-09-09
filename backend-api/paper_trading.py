@@ -395,6 +395,94 @@ def get_performance_summary():
     }
 
 
+def get_account_snapshot() -> dict:
+    """Current paper-account value straight from Alpaca -- equity is
+    cash + long/short market value, computed server-side by Alpaca (same
+    field run_daily_check already reads for its buying-power check), not
+    something this app tallies itself from the trades table. last_equity
+    is the prior trading day's 4pm mark, so a same-day change falls out
+    of the two directly."""
+    client = get_trading_client()
+    account = client.get_account()
+
+    def _f(v):
+        return float(v) if v is not None else None
+
+    equity = _f(account.equity)
+    last_equity = _f(account.last_equity)
+    day_change_usd = (equity - last_equity) if (equity is not None and last_equity is not None) else None
+    day_change_pct = (day_change_usd / last_equity * 100) if (day_change_usd is not None and last_equity) else None
+
+    return {
+        "equity": equity,
+        "cash": _f(account.cash),
+        "last_equity": last_equity,
+        "day_change_usd": day_change_usd,
+        "day_change_pct": day_change_pct,
+        "as_of": datetime.now().isoformat(),
+    }
+
+
+# Maps the screen's 1D/1W/1M/ALL picker to Alpaca's own period+timeframe
+# vocabulary for GET /account/portfolio/history -- picking a timeframe
+# granularity that's actually reasonable for each range (a month of
+# 1-minute bars would be enormous and mostly noise).
+_PERFORMANCE_RANGES = {
+    "1D": {"period": "1D", "timeframe": "5Min"},
+    "1W": {"period": "1W", "timeframe": "15Min"},
+    "1M": {"period": "1M", "timeframe": "1D"},
+    "ALL": {"period": "all", "timeframe": "1D"},
+}
+
+
+def get_performance_history(range_key: str = "1M") -> dict:
+    """Account equity curve straight from Alpaca's own portfolio-history
+    endpoint -- same reasoning as _previous_option_closes: Alpaca already
+    tracks this server-side for the paper account (it has to, to run the
+    account at all), so this asks for it on demand instead of this app
+    snapshotting its own equity over time. `range_key` is one of
+    "1D"/"1W"/"1M"/"ALL" (anything else falls back to "1M").
+    """
+    from alpaca.trading.requests import GetPortfolioHistoryRequest
+
+    spec = _PERFORMANCE_RANGES.get((range_key or "").upper(), _PERFORMANCE_RANGES["1M"])
+    client = get_trading_client()
+    req = GetPortfolioHistoryRequest(period=spec["period"], timeframe=spec["timeframe"])
+
+    try:
+        history = client.get_portfolio_history(req)
+    except Exception as e:
+        if spec["period"] == "all":
+            # "all" isn't accepted by every account/API version -- a long
+            # fixed period is a reasonable stand-in rather than failing
+            # the whole chart over a keyword Alpaca might not recognize.
+            print(f"Portfolio history period='all' failed ({e}), falling back to 10A")
+            req = GetPortfolioHistoryRequest(period="10A", timeframe=spec["timeframe"])
+            history = client.get_portfolio_history(req)
+        else:
+            raise
+
+    points = []
+    for ts, equity, pnl, pnl_pct in zip(
+        history.timestamp or [], history.equity or [],
+        history.profit_loss or [], history.profit_loss_pct or [],
+    ):
+        if equity is None:
+            continue
+        points.append({
+            "t": datetime.fromtimestamp(ts).isoformat(),
+            "equity": equity,
+            "pnl_usd": pnl,
+            "pnl_pct": pnl_pct,
+        })
+
+    return {
+        "range": (range_key or "1M").upper(),
+        "base_value": history.base_value,
+        "points": points,
+    }
+
+
 NOTIFY_CONFIG_FILE = Path(__file__).parent / "paper_trading_notify_config.json"
 
 

@@ -76,6 +76,70 @@ function TodayChange({ p }) {
   return <ChangeLabel ticker={p.ticker} pct={p.stock_change_pct} />;
 }
 
+const PERFORMANCE_RANGES = [
+  ["1D", "1D"],
+  ["1W", "1W"],
+  ["1M", "1M"],
+  ["ALL", "All"],
+];
+
+function RangePicker({ value, onChange }) {
+  return (
+    <div style={{ display: "flex", gap: 4 }}>
+      {PERFORMANCE_RANGES.map(([key, label]) => (
+        <button
+          key={key}
+          onClick={() => onChange(key)}
+          style={{
+            fontSize: 11, fontWeight: 500, padding: "4px 10px", borderRadius: 6,
+            border: "0.5px solid var(--border)", cursor: "pointer",
+            background: value === key ? "var(--text)" : "transparent",
+            color: value === key ? "var(--bg)" : "var(--text3)",
+          }}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// Hand-rolled sparkline-style line chart -- no charting library in this
+// project, and an equity curve is simple enough (one line, no axes/
+// legend) that a small inline SVG is less overhead than adding one.
+// viewBox uses fixed pixel units stretched to the container's width via
+// CSS, same convention as other lightweight inline visuals in this app.
+function PerformanceChart({ points, color }) {
+  if (!points || points.length < 2) {
+    return (
+      <div style={{ height: 120, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: "var(--text3)" }}>
+        Not enough data yet for this range.
+      </div>
+    );
+  }
+
+  const W = 400, H = 120, PAD = 4;
+  const values = points.map(p => p.equity);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const stepX = (W - PAD * 2) / (points.length - 1);
+
+  const coords = points.map((p, i) => [
+    PAD + i * stepX,
+    PAD + (1 - (p.equity - min) / range) * (H - PAD * 2),
+  ]);
+  const linePath = coords.map(([x, y], i) => `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+  const areaPath = `${linePath} L${coords[coords.length - 1][0].toFixed(1)},${H - PAD} L${coords[0][0].toFixed(1)},${H - PAD} Z`;
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ width: "100%", height: 120, display: "block" }}>
+      <path d={areaPath} fill={color} opacity={0.12} stroke="none" />
+      <path d={linePath} fill="none" stroke={color} strokeWidth={1.5} strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 // Live positions refresh on their own timer -- separate from the one-time
 // summary/trade-history load, so opening the screen doesn't wait on an
 // Alpaca round trip, and the estimated value stays reasonably current
@@ -86,6 +150,10 @@ export default function PaperTradingScreen({ onTab }) {
   const [summary, setSummary] = useState(null);
   const [positions, setPositions] = useState([]);
   const [trades, setTrades] = useState([]);
+  const [account, setAccount] = useState(null);
+  const [perfRange, setPerfRange] = useState("1M");
+  const [perfData, setPerfData] = useState(null);
+  const [perfLoading, setPerfLoading] = useState(true);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -96,11 +164,13 @@ export default function PaperTradingScreen({ onTab }) {
       fetch(`${API_BASE}/paper-trading/summary`).then(r => r.json()),
       fetch(`${API_BASE}/paper-trading/positions-live`).then(r => r.json()),
       fetch(`${API_BASE}/paper-trading/trades`).then(r => r.json()),
+      fetch(`${API_BASE}/paper-trading/account`).then(r => r.json()),
     ])
-      .then(([summaryData, positionsData, tradesData]) => {
+      .then(([summaryData, positionsData, tradesData, accountData]) => {
         setSummary(summaryData);
         setPositions(positionsData.positions || []);
         setTrades(tradesData.trades || []);
+        setAccount(accountData);
         setLoading(false);
       })
       .catch(() => {
@@ -119,7 +189,32 @@ export default function PaperTradingScreen({ onTab }) {
     return () => clearInterval(interval);
   }, []);
 
+  useEffect(() => {
+    const interval = setInterval(() => {
+      fetch(`${API_BASE}/paper-trading/account`)
+        .then(r => r.json())
+        .then(setAccount)
+        .catch(() => {});
+    }, POSITIONS_LIVE_POLL_MS);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    setPerfLoading(true);
+    fetch(`${API_BASE}/paper-trading/performance?range=${perfRange}`)
+      .then(r => r.json())
+      .then(d => {
+        setPerfData(d);
+        setPerfLoading(false);
+      })
+      .catch(() => setPerfLoading(false));
+  }, [perfRange]);
+
   const closedTrades = trades.filter(t => t.status === "closed");
+  const perfPoints = perfData && perfData.points;
+  const perfUp = perfPoints && perfPoints.length > 1
+    ? perfPoints[perfPoints.length - 1].equity >= perfPoints[0].equity
+    : true;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, fontFamily: "system-ui, sans-serif", background: "var(--bg)", overflow: "hidden" }}>
@@ -145,6 +240,30 @@ export default function PaperTradingScreen({ onTab }) {
 
         {summary && !loading && !error && (
           <>
+            {account && (
+              <div style={{ padding: "16px 20px 4px" }}>
+                <div style={{ fontSize: 11, color: "var(--text3)", marginBottom: 2 }}>Account Value</div>
+                <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+                  <div style={{ fontSize: 28, fontWeight: 600, color: "var(--text)", fontVariantNumeric: "tabular-nums" }}>
+                    {formatMoney(account.equity)}
+                  </div>
+                  {account.day_change_pct != null && (
+                    <div style={{
+                      fontSize: 13, fontWeight: 600, fontVariantNumeric: "tabular-nums",
+                      color: account.day_change_pct > 0 ? "var(--up)" : account.day_change_pct < 0 ? "var(--down)" : "var(--text4)",
+                    }}>
+                      {account.day_change_pct > 0 ? "+" : ""}{account.day_change_pct.toFixed(2)}%
+                    </div>
+                  )}
+                </div>
+                {account.day_change_usd != null && (
+                  <div style={{ fontSize: 11, color: "var(--text4)", marginTop: 2 }}>
+                    {account.day_change_usd > 0 ? "+" : ""}{formatMoney(account.day_change_usd)} today
+                  </div>
+                )}
+              </div>
+            )}
+
             <div style={{ display: "flex", gap: 8, padding: "16px 20px 4px" }}>
               <StatTile label="Win rate" value={summary.win_rate_pct != null ? `${summary.win_rate_pct}%` : "—"} />
               <StatTile
@@ -160,6 +279,27 @@ export default function PaperTradingScreen({ onTab }) {
             </div>
             <div style={{ padding: "8px 20px 4px", fontSize: 11, color: "var(--text4)" }}>
               {summary.closed_trades} closed trade{summary.closed_trades === 1 ? "" : "s"} · {summary.open_positions} open position{summary.open_positions === 1 ? "" : "s"}
+            </div>
+
+            <div style={{ padding: "18px 20px 8px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>Performance</div>
+              <RangePicker value={perfRange} onChange={setPerfRange} />
+            </div>
+            <div style={{ padding: "0 20px 4px" }}>
+              {perfLoading ? (
+                <div style={{ height: 120, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: "var(--text3)" }}>
+                  Loading…
+                </div>
+              ) : (
+                <PerformanceChart points={perfPoints} color={perfUp ? "var(--up)" : "var(--down)"} />
+              )}
+              {perfPoints && perfPoints.length > 1 && (
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 10, color: "var(--text4)", marginTop: 4 }}>
+                  <span style={{ fontVariantNumeric: "tabular-nums" }}>{formatMoney(perfPoints[0].equity)}</span>
+                  <PnlBadge pct={perfPoints[perfPoints.length - 1].pnl_pct} />
+                  <span style={{ fontVariantNumeric: "tabular-nums" }}>{formatMoney(perfPoints[perfPoints.length - 1].equity)}</span>
+                </div>
+              )}
             </div>
 
             <div style={{ padding: "18px 20px 6px", fontSize: 13, fontWeight: 600, color: "var(--text)" }}>

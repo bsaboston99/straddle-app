@@ -835,6 +835,28 @@ def paper_trading_summary():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/paper-trading/account")
+def paper_trading_account():
+    """Current Alpaca paper-account value (equity/cash/day change) --
+    powers the account-value figure at the top of the Paper Trading
+    screen. See paper_trading.get_account_snapshot."""
+    try:
+        return paper_trading.get_account_snapshot()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/paper-trading/performance")
+def paper_trading_performance(range: str = "1M"):
+    """Account equity curve for the Paper Trading screen's performance
+    chart. `range` is one of 1D/1W/1M/ALL. See
+    paper_trading.get_performance_history."""
+    try:
+        return paper_trading.get_performance_history(range)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/paper-trading/trades")
 def paper_trading_trades():
     try:
