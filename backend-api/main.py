@@ -31,9 +31,21 @@ COMBINED_DIR = Path(os.environ.get(
 
 df_global = None
 
-# Per-ticker slices of df_global, rebuilt alongside it. Endpoints that loop
-# over many tickers (like /watchlist-live) filter/copy from this instead of
-# re-scanning the full 80k+-row df_global once per ticker.
+# Per-ticker ROW POSITIONS into df_global (not copies of the rows
+# themselves), rebuilt alongside it. Endpoints that loop over many tickers
+# (like /watchlist-live) use this to slice df_global.iloc[...] on demand
+# instead of re-scanning the full 80k+-row df_global once per ticker.
+#
+# This used to be {ticker: sub-DataFrame} -- a dict comprehension over
+# df_global.groupby("ticker"), which materializes a full COPY of every row
+# in df_global a second time (every row belongs to exactly one ticker
+# group, so the copies summed to ~the same size as df_global itself).
+# That meant the whole dataset was held in memory TWICE, permanently, for
+# the life of the process -- confirmed as a major contributor to
+# insignia-api repeatedly hitting Render's 512MB memory limit. Storing
+# just the integer positions (a handful of int64s per ticker, ~1MB total
+# vs. tens-to-hundreds of MB) gets the same "skip re-scanning df_global"
+# benefit at the call site without permanently duplicating the data.
 TICKER_GROUPS = {}
 
 FEATHER_CACHE = Path(__file__).parent / "df_cache.feather"
@@ -81,7 +93,11 @@ async def startup_event():
     global df_global, TICKER_GROUPS
     try:
         df_global = _load_df()
-        TICKER_GROUPS = {t: sub for t, sub in df_global.groupby("ticker")}
+        # .indices (not .groups) -- returns {ticker: ndarray of integer row
+        # positions}, suitable for df_global.iloc[...]. This is the piece
+        # that avoids duplicating df_global's data; see the TICKER_GROUPS
+        # comment above.
+        TICKER_GROUPS = df_global.groupby("ticker", sort=False).indices
     except Exception as e:
         print(f"WARNING: Could not load data: {e}")
         df_global = None
@@ -656,8 +672,13 @@ def get_watchlist_live():
     def compute_one(ticker):
         # Per-ticker slice instead of the full 80k+-row df_global -- this
         # function runs once per ticker on every /watchlist-live call, so
-        # skipping a full-table scan each time matters.
-        ticker_df = TICKER_GROUPS.get(ticker, df_global)
+        # skipping a full-table scan each time matters. TICKER_GROUPS now
+        # holds row positions, not copied sub-DataFrames (see its
+        # declaration above) -- .iloc[...] builds the small slice here, on
+        # demand, instead of it having been copied and held in memory for
+        # every ticker since startup.
+        positions = TICKER_GROUPS.get(ticker)
+        ticker_df = df_global.iloc[positions] if positions is not None else df_global
 
         if ticker in live_tickers:
             try:
