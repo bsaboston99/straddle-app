@@ -59,20 +59,28 @@ services:
     startCommand: python -c "import requests; requests.post('https://insignia-api-qkex.onrender.com/alerts/trigger')"
 
   # ── Continuous paper-trading signal check + entry/exit execution ───────────
-  # Polls every 5 minutes, weekdays only -- the actual market-hours gate
+  # Polls every 5 minutes, weekdays, 9am-5pm ET only -- no need to run
+  # overnight or on weekend mornings, and doing so was adding needless load
+  # to insignia-api around the clock. The actual market-hours gate still
   # lives server-side in paper_trading.run_daily_check() (checks Alpaca's
   # own market clock), so this schedule just bounds it to roughly the right
-  # days; off-hours calls within those days return almost immediately as a
-  # no-op rather than doing real work against stale quotes. Render bills
-  # cron jobs per second of actual execution, not by uptime, so this cadence
-  # costs negligibly more than the old once-a-day version -- the real reason
-  # to run this often is catching the model's target-exit level (see
-  # paper_trading.py) as soon as it's hit intraday, instead of only once a
-  # day and potentially missing a move that reverses before the next check.
+  # window; the 13-21 UTC range below is deliberately widened by an hour on
+  # each side to cover both EST (9am ET = 14 UTC) and EDT (9am ET = 13 UTC)
+  # without needing to be hand-adjusted at the DST changeover -- the actual
+  # 9am-5pm ET cutoff is enforced precisely, every run, by
+  # cron_paper_trading_check.py (via zoneinfo), which this startCommand now
+  # calls instead of firing the POST directly. Render bills cron jobs per
+  # second of actual execution, not by uptime, so the wasted early/late
+  # UTC-buffer runs (which exit almost instantly without ever calling
+  # insignia-api) cost negligibly more than a perfectly tight window would.
+  # The real reason to run this often within the window is catching the
+  # model's target-exit level (see paper_trading.py) as soon as it's hit
+  # intraday, instead of only once a day and potentially missing a move
+  # that reverses before the next check.
   - type: cron
     name: insignia-paper-trading
     runtime: python
     rootDir: backend-api
     buildCommand: pip install requests
-    schedule: "*/5 * * * 1-5"
-    startCommand: python -c "import requests; requests.post('https://insignia-api-qkex.onrender.com/paper-trading/run-daily-check')"
+    schedule: "*/5 13-21 * * 1-5"
+    startCommand: python cron_paper_trading_check.py

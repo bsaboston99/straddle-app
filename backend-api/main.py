@@ -9,6 +9,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from straddle_analysis import load_all_data, add_relative_straddles, get_straddle_percentile, get_straddle_percentile_live
 import paper_trading
 import live_quotes
@@ -104,18 +105,48 @@ async def _prewarm_earnings():
     await loop.run_in_executor(None, lambda: get_earnings(universe="all", weeks=8))
     print("Earnings pre-warm complete.")
 
+
+# Trading-hours window for the always-on prewarm loop below. Checked in ET
+# (not UTC, not the server's local time) via zoneinfo so it stays correct
+# across the EST/EDT changeover with no manual adjustment. There's no need
+# to keep the ThreadPoolExecutor/Alpaca-call/DataFrame-copy churn of
+# get_watchlist_live() running overnight and on weekend mornings when no
+# one's looking at the Watchlist screen -- that loop was found to be the
+# single biggest steady-state contributor to insignia-api's memory usage
+# (every ~55s, 24/7, regardless of market hours), so gating it here directly
+# addresses that instead of just reducing its frequency.
+PREWARM_TZ = ZoneInfo("America/New_York")
+PREWARM_START_HOUR = 9   # 9am ET
+PREWARM_END_HOUR = 17    # 5pm ET (exclusive)
+
+def _within_prewarm_window() -> bool:
+    now_et = datetime.now(PREWARM_TZ)
+    return PREWARM_START_HOUR <= now_et.hour < PREWARM_END_HOUR
+
+
 async def _prewarm_watchlist_live():
     await asyncio.sleep(5)  # let df_global/earnings pre-warm settle first
     loop = asyncio.get_event_loop()
     while True:
-        try:
-            await loop.run_in_executor(None, get_watchlist_live)
-            print("Watchlist live pre-warm complete.")
-        except Exception as e:
-            print(f"Watchlist live pre-warm failed: {e}")
-        # Refresh a few seconds before the cache would otherwise expire, so
-        # there's effectively never a cold cache for a real request to hit.
-        await asyncio.sleep(max(WATCHLIST_LIVE_TTL_SECONDS - 5, 5))
+        if _within_prewarm_window():
+            try:
+                await loop.run_in_executor(None, get_watchlist_live)
+                print("Watchlist live pre-warm complete.")
+            except Exception as e:
+                print(f"Watchlist live pre-warm failed: {e}")
+            # Refresh a few seconds before the cache would otherwise expire,
+            # so there's effectively never a cold cache for a real request
+            # to hit during trading hours.
+            await asyncio.sleep(max(WATCHLIST_LIVE_TTL_SECONDS - 5, 5))
+        else:
+            # Outside 9am-5pm ET: do no work at all (no thread pool, no
+            # Alpaca calls, no DataFrame copies) and just recheck
+            # periodically so the loop picks back up promptly once the
+            # window opens. A real user opening the Watchlist screen
+            # off-hours still gets a live (uncached) result -- this only
+            # stops the *automatic* background refresh, per get_watchlist_live
+            # itself, which is unaffected by this gate.
+            await asyncio.sleep(300)
 
 SP500 = [
     "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","BRK-B","JPM","UNH",
