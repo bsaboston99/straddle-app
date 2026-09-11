@@ -211,7 +211,12 @@ export default function WatchlistScreen({ onSelectTicker, onTab, earningsMap }) 
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, fontFamily: "system-ui, sans-serif", background: "var(--bg)", overflow: "hidden" }}>
 
-      <div className="safe-top" style={{ padding: "18px 20px 12px", borderBottom: "0.5px solid var(--border)", flexShrink: 0 }}>
+      {/* paddingTop uses calc() instead of the "padding" shorthand -- an inline
+          shorthand overrides the .safe-top class's padding-top rule (inline
+          beats stylesheet regardless of specificity), which silently dropped
+          env(safe-area-inset-top) and made the header sit flush against the
+          notch/status bar on a notched-phone PWA. */}
+      <div className="safe-top" style={{ paddingTop: "calc(18px + env(safe-area-inset-top, 0px))", paddingRight: 20, paddingBottom: 12, paddingLeft: 20, borderBottom: "0.5px solid var(--border)", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
           <h1 style={{ fontSize: 20, fontWeight: 500, margin: 0, color: "var(--text)" }}>Watchlist</h1>
           <div style={{ display: "flex", gap: 16, color: "var(--text4)" }}>

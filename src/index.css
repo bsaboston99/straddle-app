@@ -79,4 +79,12 @@ input::placeholder { color: var(--text4); }
 
 /* ── Safe area for notched iPhones ── */
 .safe-bottom { padding-bottom: env(safe-area-inset-bottom, 0px); }
+/* .safe-top's own padding-top rule is inert wherever the element also sets
+   an inline `padding` shorthand (a shorthand that touches padding-top
+   always overrides a class rule, regardless of specificity) -- every screen
+   header does exactly that, so each one bakes the inset directly into its
+   own inline paddingTop via calc(Npx + env(safe-area-inset-top, 0px))
+   instead of relying on this class. Left here as a fallback for any new
+   element that uses className="safe-top" WITHOUT also setting its own
+   inline padding-top/padding. */
 .safe-top { padding-top: env(safe-area-inset-top, 0px); }

@@ -196,7 +196,12 @@ function PositionDetailView({ position: p, onBack, onTab }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, fontFamily: "system-ui, sans-serif", background: "var(--bg)", overflow: "hidden" }}>
-      <div className="safe-top" style={{ display: "flex", alignItems: "center", gap: 12, padding: "16px 20px 14px", borderBottom: "0.5px solid var(--border)", flexShrink: 0 }}>
+      {/* paddingTop uses calc() instead of the "padding" shorthand -- an inline
+          shorthand overrides the .safe-top class's padding-top rule (inline
+          beats stylesheet regardless of specificity), which silently dropped
+          env(safe-area-inset-top) and made the header sit flush against the
+          notch/status bar on a notched-phone PWA. */}
+      <div className="safe-top" style={{ display: "flex", alignItems: "center", gap: 12, paddingTop: "calc(16px + env(safe-area-inset-top, 0px))", paddingRight: 20, paddingBottom: 14, paddingLeft: 20, borderBottom: "0.5px solid var(--border)", flexShrink: 0 }}>
         <button onClick={onBack} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 22, color: "var(--text2)", padding: 0 }}>
           &#8592;
         </button>
@@ -347,7 +352,12 @@ export default function PaperTradingScreen({ onTab }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, fontFamily: "system-ui, sans-serif", background: "var(--bg)", overflow: "hidden" }}>
 
-      <div className="safe-top" style={{ padding: "18px 20px 14px", borderBottom: "0.5px solid var(--border)", flexShrink: 0 }}>
+      {/* paddingTop uses calc() instead of the "padding" shorthand -- an inline
+          shorthand overrides the .safe-top class's padding-top rule (inline
+          beats stylesheet regardless of specificity), which silently dropped
+          env(safe-area-inset-top) and made the header sit flush against the
+          notch/status bar on a notched-phone PWA. */}
+      <div className="safe-top" style={{ paddingTop: "calc(18px + env(safe-area-inset-top, 0px))", paddingRight: 20, paddingBottom: 14, paddingLeft: 20, borderBottom: "0.5px solid var(--border)", flexShrink: 0 }}>
         <h1 style={{ fontSize: 20, fontWeight: 500, margin: "0 0 4px", color: "var(--text)" }}>Paper Trading</h1>
         <div style={{ fontSize: 12, color: "var(--text3)" }}>
           Earnings-straddle model, Alpaca paper account — not real money
