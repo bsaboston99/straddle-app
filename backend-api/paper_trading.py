@@ -3,9 +3,35 @@ Paper trading engine for the earnings-straddle strategy.
 
 Scope and honesty check up front: the ledger, rule logic, and position sizing
 here follow exactly what was calibrated and agreed on earlier (entry when
-dbe is 2 or 3 and the model's predicted_log_ratio >= 0.3, 10% of current
+dbe is 0-3 and the model's predicted_log_ratio >= 0.3, 10% of current
 equity per trade, no hard concurrency cap -- just skip a signal if there
 isn't enough buying power). That part is solid.
+
+ENTRY_DBE_MIN was widened from 2 to 0 -- entries are now allowed all the way
+through dbe==0, which used to be reserved purely as the exit backstop day.
+For a BMO ticker that means a same-day entry can be placed and then get
+immediately caught by that same dbe==0 backstop on the very next poll (5
+minutes later, or whenever the target check next runs) -- a deliberate,
+accepted tradeoff (see run_daily_check's exit section) rather than an
+oversight: a dbe==0 entry is effectively a short, same-day attempt at
+catching the last bit of pre-earnings drift, not a multi-day hold.
+
+compute_dbe was also fixed here: dbe==0 used to be reachable ONLY for BMO
+tickers (AMC tickers' dbe skipped straight from 1 to None the day after the
+print, so the backstop never fired for them). The formula is now the same
+for both -- see compute_dbe's docstring. One side effect worth knowing:
+this shifts AMC tickers' dbe numbering back by one trading day compared to
+before (what used to read dbe==2 for an AMC name now reads dbe==1 for that
+same calendar day), since the old AMC formula was off by one relative to
+BMO. BMO numbering is unchanged.
+
+Worth being honest about: the "entry threshold was calibrated" claim above
+was specifically calibrated against dbe 2-3 entries. The model itself takes
+dbe as a feature, so it isn't blind to dbe 0-1, but entries this close to
+the print have much less runway before the dbe==0 backstop (or, for a
+same-day dbe==0 entry, essentially none) -- that specific regime hasn't
+been backtested the way dbe 2-3 was. Worth watching dbe 0-1 entries
+separately from dbe 2-3 ones until there's a track record.
 
 Exit is now two-layered. The model's predicted_log_ratio at entry sets a
 concrete target_rel_straddle_a (entry_rel_straddle_a * exp(predicted_log_ratio)),
@@ -14,6 +40,16 @@ computed for the held contracts and compared against that target -- hit it,
 and the position sells immediately instead of waiting. dbe==0 remains a hard
 backstop exit regardless of the target, since holding through the actual
 earnings print was never part of this strategy.
+
+Per-leg entry prices (call_entry_price/put_entry_price) are now recorded
+alongside the combined entry_cost, and enrich_positions_live now returns
+each leg's current price and its own pnl_pct -- this is what backs the
+Trading tab's per-position detail view (call/put entry vs. current price
+and % change, plus the underlying stock's price change). Trades entered
+before this migration have NULL call_entry_price/put_entry_price -- there's
+no historical split to backfill from just the combined entry_cost, so the
+detail view shows those two legs as unavailable for older trades rather
+than guessing a 50/50 split.
 
 CAVEAT worth being honest about: the model was trained to predict
 rel_straddle_a movement between historical (entry_dbe, exit_dbe) pairs, not
@@ -64,7 +100,7 @@ import notifications
 # Configuration
 # ---------------------------------------------------------------------------
 
-ENTRY_DBE_MIN, ENTRY_DBE_MAX = 2, 3
+ENTRY_DBE_MIN, ENTRY_DBE_MAX = 0, 3
 THRESHOLD = 0.3
 POSITION_FRACTION = 0.10  # 10% of current equity per trade
 
@@ -184,6 +220,15 @@ def init_db():
             ("target_rel_straddle_a", "REAL"),
             ("qty", "INTEGER"),
             ("entry_time", "TEXT"),  # full timestamp; entry_date above is date-only
+            # Per-leg entry prices -- entry_cost above is only the combined
+            # call+put price, which is all run_daily_check used to keep.
+            # These let the Trading tab's position-detail view show each
+            # leg's own entry->current move rather than just the combined
+            # straddle. Trades entered before this migration will have NULL
+            # here -- there's no historical call/put split to backfill, so
+            # the detail view falls back to "not recorded for this trade".
+            ("call_entry_price", "REAL"),
+            ("put_entry_price", "REAL"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {coltype}")
@@ -212,17 +257,20 @@ def get_open_trade(ticker, er_date):
 
 def record_trade_entry(ticker, er_date, call_symbol, put_symbol, predicted_log_ratio,
                         position_size_usd, entry_cost, order_id, entry_rel_straddle_a=None,
-                        target_rel_straddle_a=None, qty=1, notes=""):
+                        target_rel_straddle_a=None, qty=1, notes="",
+                        call_entry_price=None, put_entry_price=None):
     with get_db() as conn:
         now = datetime.now()
         conn.execute(
             "INSERT INTO trades (ticker, er_date, entry_date, entry_time, call_symbol, put_symbol, "
             "predicted_log_ratio, position_size_usd, entry_cost, status, alpaca_entry_order_id, "
-            "entry_rel_straddle_a, target_rel_straddle_a, qty, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
+            "entry_rel_straddle_a, target_rel_straddle_a, qty, notes, "
+            "call_entry_price, put_entry_price) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)",
             (ticker, er_date, now.date().isoformat(), now.isoformat(), call_symbol, put_symbol,
              predicted_log_ratio, position_size_usd, entry_cost, order_id,
-             entry_rel_straddle_a, target_rel_straddle_a, qty, notes),
+             entry_rel_straddle_a, target_rel_straddle_a, qty, notes,
+             call_entry_price, put_entry_price),
         )
 
 
@@ -299,6 +347,13 @@ def enrich_positions_live(positions: list) -> list:
     having a previous-close field), and the underlying's own
     stock_price/stock_change_pct as a secondary reference point.
 
+    Also adds per-leg current prices (call_current_price/put_current_price)
+    and, where the trade has call_entry_price/put_entry_price recorded (see
+    record_trade_entry -- trades entered before that column existed won't),
+    per-leg call_pnl_pct/put_pnl_pct. This is what powers the Trading tab's
+    per-position detail view -- the combined current_straddle_price above
+    hides which leg is actually driving the move.
+
     Never raises -- a batch failure just means the affected fields are
     left out of the returned dicts, so the caller can still show the
     static (entry-time) fields.
@@ -348,6 +403,16 @@ def enrich_positions_live(positions: list) -> list:
     for row in enriched:
         call_mid = option_mids.get(row.get("call_symbol"))
         put_mid = option_mids.get(row.get("put_symbol"))
+        if call_mid is not None:
+            row["call_current_price"] = call_mid
+            call_entry = row.get("call_entry_price")
+            if call_entry:
+                row["call_pnl_pct"] = (call_mid - call_entry) / call_entry * 100
+        if put_mid is not None:
+            row["put_current_price"] = put_mid
+            put_entry = row.get("put_entry_price")
+            if put_entry:
+                row["put_pnl_pct"] = (put_mid - put_entry) / put_entry * 100
         if call_mid is not None and put_mid is not None:
             current_straddle_price = call_mid + put_mid
             qty = row.get("qty") or 1
@@ -536,6 +601,25 @@ def _is_weekend(d):
 def compute_dbe(er_date_str, er_time, today=None):
     """Trading days between today and the last day you could still act
     before the print (mirrors EarningsScreen.jsx's tradingDaysUntil).
+
+    last_day_to_act is the last trading day you could still place or hold a
+    trade before the print itself happens: for BMO (before market open) that
+    is the trading day *before* er_date, since by the time er_date's market
+    opens the print has already happened; for AMC (after close) that is
+    er_date itself, since the print doesn't happen until after that day's
+    close.
+
+    dbe is then how many trading days remain between today and that last
+    actionable day -- 0 means "today IS the last actionable day," which is
+    also the trigger for run_daily_check's exit backstop. This max(count-1,0)
+    formula is applied the same way regardless of er_time: last_day_to_act
+    already encodes the BMO/AMC difference above, so applying the same
+    "days remaining" arithmetic on top of it keeps dbe==0 meaningful for
+    both. (Earlier this repo only applied the -1 step for BMO, which meant
+    dbe skipped from 1 straight to None for AMC tickers -- dbe==0, and the
+    backstop exit tied to it, never fired for them. Fixed here; note this
+    shifts AMC dbe numbering back by one trading day vs. before.)
+
     Does not account for market holidays -- same limitation as the existing
     /alerts cron, which also uses a fixed calendar. Good enough for now,
     worth revisiting if a holiday-heavy earnings week produces a wrong dbe.
@@ -562,7 +646,7 @@ def compute_dbe(er_date_str, er_time, today=None):
             count += 1
         cursor += timedelta(days=1)
 
-    return max(count - 1, 0) if er_time == "BMO" else count
+    return max(count - 1, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -978,7 +1062,7 @@ def run_daily_check(upcoming_earnings):
         except Exception as e:
             results["errors"].append({"ticker": trade["ticker"], "stage": "target_check", "error": str(e)})
 
-    # --- entries: tickers currently at dbe 2-3 with no open position yet ---
+    # --- entries: tickers currently at dbe 0-3 with no open position yet ---
     for ticker, info in upcoming_earnings.items():
         dbe = compute_dbe(info["date"], info.get("time", "TBD"))
         er_date = info["date"]
@@ -1008,6 +1092,12 @@ def run_daily_check(upcoming_earnings):
                 if entry_rel_straddle_a is not None and not np.isnan(entry_rel_straddle_a)
                 else None
             )
+            # compute_live_features already priced each leg separately
+            # (callclose_a/putclose_a) before summing them into entry_cost --
+            # kept here so the Trading tab's position detail can show each
+            # leg's own entry price, not just the combined straddle cost.
+            call_entry_price = feat.get("callclose_a")
+            put_entry_price = feat.get("putclose_a")
 
             order, qty = place_straddle_entry(call_sym, put_sym, position_size_usd, entry_cost)
             record_trade_entry(
@@ -1016,6 +1106,8 @@ def run_daily_check(upcoming_earnings):
                 entry_rel_straddle_a=entry_rel_straddle_a,
                 target_rel_straddle_a=target_rel_straddle_a,
                 qty=qty,
+                call_entry_price=call_entry_price,
+                put_entry_price=put_entry_price,
             )
             log_signal(ticker, er_date, dbe, predicted_log_ratio, "entered")
             results["entries"].append({
