@@ -26,6 +26,19 @@ function formatPrice(n) {
   return `$${n.toFixed(2)}`;
 }
 
+// predicted_log_ratio is a LOG ratio (the model's raw training target,
+// log(exit_rel_straddle_a / entry_rel_straddle_a)), not a plain percentage
+// -- turning it into "how far up is the target" needs exp(), the same
+// conversion paper_trading.py's own push notifications already use
+// (predicted_pct = (exp(predicted_log_ratio) - 1) * 100). This used to be
+// shown as `predicted_log_ratio * 100` directly, which understates the
+// real target (e.g. the 0.3 entry threshold read as "+30%" here but is
+// really a ~+35% target).
+function targetPct(predictedLogRatio) {
+  if (predictedLogRatio === null || predictedLogRatio === undefined) return null;
+  return (Math.exp(predictedLogRatio) - 1) * 100;
+}
+
 function StatTile({ label, value, color }) {
   return (
     <div style={{ flex: 1, padding: "12px 10px", background: "var(--surface)", borderRadius: 10, border: "0.5px solid var(--border)" }}>
@@ -140,6 +153,107 @@ function PerformanceChart({ points, color }) {
   );
 }
 
+// One leg (call or put) of an open straddle: entry price -> current price
+// and the leg's own % change. `entry`/`current` can be null/undefined --
+// current is missing on a quote-fetch failure, entry is missing for a
+// trade opened before call_entry_price/put_entry_price were recorded
+// (see paper_trading.py's record_trade_entry).
+function LegCard({ label, entry, current, pnlPct }) {
+  const hasEntry = entry !== null && entry !== undefined;
+  const hasCurrent = current !== null && current !== undefined;
+  return (
+    <div style={{ flex: 1, padding: "12px 14px", background: "var(--surface)", borderRadius: 10, border: "0.5px solid var(--border)" }}>
+      <div style={{ fontSize: 11, color: "var(--text3)", marginBottom: 6 }}>{label}</div>
+      {hasEntry ? (
+        <>
+          <div style={{ fontSize: 15, fontWeight: 600, color: "var(--text)", fontVariantNumeric: "tabular-nums" }}>
+            {hasCurrent ? formatPrice(current) : formatPrice(entry)}
+          </div>
+          <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2, fontVariantNumeric: "tabular-nums" }}>
+            entry {formatPrice(entry)}
+          </div>
+          {pnlPct != null && (
+            <div style={{ marginTop: 4 }}><PnlBadge pct={pnlPct} /></div>
+          )}
+        </>
+      ) : (
+        <div style={{ fontSize: 11, color: "var(--text4)", marginTop: 2 }}>
+          Not recorded for this trade
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Full breakdown for one open position -- pushed over the list when a
+// position row is tapped. `position` comes straight from the same
+// positions-live state the list uses, so it keeps refreshing on the same
+// 60s poll without this view needing its own fetch.
+function PositionDetailView({ position: p, onBack, onTab }) {
+  const entryTime = formatTime(p.entry_time);
+  const target = targetPct(p.predicted_log_ratio);
+  const hasStock = p.stock_price != null;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", flex: 1, fontFamily: "system-ui, sans-serif", background: "var(--bg)", overflow: "hidden" }}>
+      <div className="safe-top" style={{ display: "flex", alignItems: "center", gap: 12, padding: "16px 20px 14px", borderBottom: "0.5px solid var(--border)", flexShrink: 0 }}>
+        <button onClick={onBack} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 22, color: "var(--text2)", padding: 0 }}>
+          &#8592;
+        </button>
+        <div>
+          <div style={{ fontSize: 18, fontWeight: 500, color: "var(--text)" }}>{p.ticker}</div>
+          <div style={{ fontSize: 12, color: "var(--text2)", marginTop: 1 }}>
+            Entered {formatDate(p.entry_date)}{entryTime ? ` at ${entryTime}` : ""} · earnings {formatDate(p.er_date)}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px 20px 24px" }}>
+
+        <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)", marginBottom: 8 }}>Stock</div>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 8, padding: "12px 14px", background: "var(--surface)", borderRadius: 10, border: "0.5px solid var(--border)", marginBottom: 18 }}>
+          <div style={{ fontSize: 20, fontWeight: 600, color: "var(--text)", fontVariantNumeric: "tabular-nums" }}>
+            {hasStock ? formatPrice(p.stock_price) : "—"}
+          </div>
+          {p.stock_change_pct != null && <PnlBadge pct={p.stock_change_pct} />}
+          <span style={{ fontSize: 11, color: "var(--text4)" }}>today</span>
+        </div>
+
+        <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)", marginBottom: 8 }}>Options Legs</div>
+        <div style={{ display: "flex", gap: 8, marginBottom: 18 }}>
+          <LegCard label="Call" entry={p.call_entry_price} current={p.call_current_price} pnlPct={p.call_pnl_pct} />
+          <LegCard label="Put" entry={p.put_entry_price} current={p.put_current_price} pnlPct={p.put_pnl_pct} />
+        </div>
+
+        <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)", marginBottom: 8 }}>Combined Straddle</div>
+        <div style={{ padding: "12px 14px", background: "var(--surface)", borderRadius: 10, border: "0.5px solid var(--border)", marginBottom: 18 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <div style={{ fontSize: 11, color: "var(--text3)" }}>Entry {formatPrice(p.entry_cost)} → now {formatPrice(p.current_straddle_price)}</div>
+            {p.unrealized_pnl_pct != null && <PnlBadge pct={p.unrealized_pnl_pct} />}
+          </div>
+          <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 6 }}>
+            Position value: {p.current_value_usd != null ? formatMoney(p.current_value_usd) : formatMoney(p.position_size_usd)}
+            {p.qty ? ` · ${p.qty} contract${p.qty !== 1 ? "s" : ""}` : ""}
+          </div>
+          {target != null && (
+            <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 6 }}>
+              Target +{target.toFixed(0)}% · sells automatically if hit, or at dbe=0
+            </div>
+          )}
+        </div>
+
+        {p.live_as_of && (
+          <div style={{ fontSize: 10, color: "var(--text4)" }}>
+            Live data as of {formatTime(p.live_as_of)}
+          </div>
+        )}
+      </div>
+
+      <TabBar active="Trading" onTab={onTab} />
+    </div>
+  );
+}
+
 // Live positions refresh on their own timer -- separate from the one-time
 // summary/trade-history load, so opening the screen doesn't wait on an
 // Alpaca round trip, and the estimated value stays reasonably current
@@ -156,6 +270,7 @@ export default function PaperTradingScreen({ onTab }) {
   const [perfLoading, setPerfLoading] = useState(true);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [selectedPositionId, setSelectedPositionId] = useState(null);
 
   useEffect(() => {
     setLoading(true);
@@ -215,6 +330,19 @@ export default function PaperTradingScreen({ onTab }) {
   const perfUp = perfPoints && perfPoints.length > 1
     ? perfPoints[perfPoints.length - 1].equity >= perfPoints[0].equity
     : true;
+
+  // Derived from `positions`, not a frozen snapshot -- so the detail view
+  // keeps refreshing on the same 60s poll as the list. If the position
+  // closed or dropped out from under the user while this was open (e.g.
+  // the target hit while they had it on screen), fall back to the list
+  // rather than showing stale/undefined data.
+  const selectedPosition = selectedPositionId != null
+    ? positions.find(p => p.id === selectedPositionId) || null
+    : null;
+
+  if (selectedPositionId != null && selectedPosition) {
+    return <PositionDetailView position={selectedPosition} onBack={() => setSelectedPositionId(null)} onTab={onTab} />;
+  }
 
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, fontFamily: "system-ui, sans-serif", background: "var(--bg)", overflow: "hidden" }}>
@@ -310,8 +438,13 @@ export default function PaperTradingScreen({ onTab }) {
             ) : positions.map(p => {
               const entryTime = formatTime(p.entry_time);
               const hasLive = p.current_value_usd != null;
+              const target = targetPct(p.predicted_log_ratio);
               return (
-                <div key={p.id} style={{ display: "flex", alignItems: "flex-start", padding: "12px 20px", borderBottom: "0.5px solid var(--border)", gap: 10 }}>
+                <div
+                  key={p.id}
+                  onClick={() => setSelectedPositionId(p.id)}
+                  style={{ display: "flex", alignItems: "flex-start", padding: "12px 20px", borderBottom: "0.5px solid var(--border)", gap: 10, cursor: "pointer" }}
+                >
                   <div style={{ flex: 1 }}>
                     <div style={{ fontSize: 15, fontWeight: 500, color: "var(--text)" }}>{p.ticker}</div>
                     <div style={{ fontSize: 11, color: "var(--text3)" }}>
@@ -320,18 +453,28 @@ export default function PaperTradingScreen({ onTab }) {
                     <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2, fontVariantNumeric: "tabular-nums" }}>
                       Entry {formatPrice(p.entry_cost)}{hasLive ? ` → now ${formatPrice(p.current_straddle_price)}` : ""}
                     </div>
-                  </div>
-                  <div style={{ textAlign: "right" }}>
-                    <div style={{ fontSize: 12, color: "var(--text2)", fontVariantNumeric: "tabular-nums" }}>
-                      {hasLive ? formatMoney(p.current_value_usd) : formatMoney(p.position_size_usd)}
-                    </div>
-                    {hasLive && p.unrealized_pnl_pct != null && (
-                      <div style={{ marginTop: 2 }}><PnlBadge pct={p.unrealized_pnl_pct} /></div>
+                    {target != null && (
+                      <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2, fontVariantNumeric: "tabular-nums" }}>
+                        Target +{target.toFixed(0)}% · sells automatically if hit
+                      </div>
                     )}
-                    <TodayChange p={p} />
-                    <div style={{ fontSize: 10, color: "var(--text4)", marginTop: 2 }}>
-                      predicted +{(p.predicted_log_ratio * 100).toFixed(0)}%
+                  </div>
+                  <div style={{ textAlign: "right", display: "flex", alignItems: "center", gap: 8 }}>
+                    <div>
+                      <div style={{ fontSize: 12, color: "var(--text2)", fontVariantNumeric: "tabular-nums" }}>
+                        {hasLive ? formatMoney(p.current_value_usd) : formatMoney(p.position_size_usd)}
+                      </div>
+                      {hasLive && p.unrealized_pnl_pct != null && (
+                        <div style={{ marginTop: 2 }}><PnlBadge pct={p.unrealized_pnl_pct} /></div>
+                      )}
+                      <TodayChange p={p} />
+                      {target != null && (
+                        <div style={{ fontSize: 10, color: "var(--text4)", marginTop: 2 }}>
+                          target +{target.toFixed(0)}%
+                        </div>
+                      )}
                     </div>
+                    <span style={{ fontSize: 16, color: "var(--text4)", flexShrink: 0 }}>&#8250;</span>
                   </div>
                 </div>
               );

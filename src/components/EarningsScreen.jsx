@@ -23,6 +23,20 @@ function isNonTradingDay(date) {
   return US_HOLIDAYS.has(date.toISOString().split("T")[0]);
 }
 
+// lastDayToAct is the last trading day you could still act before the
+// print itself: for BMO (before market open) that's the trading day
+// *before* the earnings date, since the print has already happened by the
+// time that date's market opens; for AMC (after close) it's the earnings
+// date itself, since the print doesn't land until after that day's close.
+// The displayed day-count is then "days remaining until that last
+// actionable day" (count - 1), applied the same way for both BMO and AMC
+// -- lastDayToAct already encodes the BMO/AMC difference above, so this
+// keeps "0 Days Before Earnings" meaningful (and reachable) for both.
+// (Previously this -1 step only applied to BMO, so an AMC ticker's count
+// went straight from 1 to "Reported" and never showed "0 Days Before
+// Earnings" -- fixed here to mirror the backend's compute_dbe, which had
+// the same bug. Mirrors paper_trading.py's compute_dbe -- keep both in
+// sync if this changes again.)
 function tradingDaysUntil(dateStr, time) {
   if (!dateStr) return null;
   const today = new Date(); today.setHours(0, 0, 0, 0);
@@ -41,13 +55,9 @@ function tradingDaysUntil(dateStr, time) {
     cursor.setDate(cursor.getDate() + 1);
   }
   if (count <= 0) return "Reported";
-  if (time === "BMO") {
-    const d = count - 1;
-    if (d === 0) return "0 Days Before Earnings";
-    return `${d} Day${d !== 1 ? "s" : ""} Before Earnings`;
-  }
-  if (count === 0) return "0 Days Before Earnings";
-  return `${count} Day${count !== 1 ? "s" : ""} Before Earnings`;
+  const d = count - 1;
+  if (d === 0) return "0 Days Before Earnings";
+  return `${d} Day${d !== 1 ? "s" : ""} Before Earnings`;
 }
 
 function formatDate(dateStr) {

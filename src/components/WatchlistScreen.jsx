@@ -1,6 +1,5 @@
 import { useState, useEffect } from "react";
 import { API_BASE } from "../data/tickers";
-import { MiniBar } from "./MiniBar";
 import TabBar from "./TabBar";
 import { IconSearch, IconBell } from "./Icons";
 
@@ -17,6 +16,9 @@ function isNonTradingDay(date) {
   return US_HOLIDAYS.has(date.toISOString().split("T")[0]);
 }
 
+// Same lastDayToAct/count logic as EarningsScreen.jsx's tradingDaysUntil
+// and the backend's compute_dbe (paper_trading.py) -- kept in sync with
+// both. Returns the abbreviated "N DBE" label used on this tab.
 function tradingDaysUntil(dateStr, time) {
   if (!dateStr) return null;
   const today = new Date(); today.setHours(0, 0, 0, 0);
@@ -35,13 +37,7 @@ function tradingDaysUntil(dateStr, time) {
     cursor.setDate(cursor.getDate() + 1);
   }
   if (count <= 0) return "Reported";
-  if (time === "BMO") {
-    const d = count - 1;
-    if (d === 0) return "0 Days Before Earnings";
-    return `${d} Day${d !== 1 ? "s" : ""} Before Earnings`;
-  }
-  if (count === 0) return "0 Days Before Earnings";
-  return `${count} Day${count !== 1 ? "s" : ""} Before Earnings`;
+  return `${count - 1} DBE`;
 }
 
 function tradingDaysCount(dateStr, time) {
@@ -55,13 +51,19 @@ function tradingDaysCount(dateStr, time) {
   }
   const startDay = new Date(today);
   while (isNonTradingDay(startDay)) startDay.setDate(startDay.getDate() + 1);
+  // Explicit already-past sentinel (-1) instead of letting the loop below
+  // fall through with count still 0 -- that used to return 0 for an AMC
+  // ticker whose earnings had already happened (count-1 was only applied
+  // to BMO), so a reported AMC ticker could still land in a dated section
+  // below instead of getting filtered into noDate via the `days < 0` check.
+  if (lastDayToAct < startDay) return -1;
   let count = 0;
   const cursor = new Date(startDay);
   while (cursor <= lastDayToAct) {
     if (!isNonTradingDay(cursor)) count++;
     cursor.setDate(cursor.getDate() + 1);
   }
-  return time === "BMO" ? count - 1 : count;
+  return count - 1;
 }
 
 function earnBadgeDate(dateStr) {
@@ -77,7 +79,6 @@ function TickerRow({ sym, onClick, earningsMap, live }) {
   const hasPrice    = live && live.price != null;
   const hasChange   = live && live.change_pct != null;
   const hasStraddle = live && live.straddle_dollar != null && live.straddle_pct != null;
-  const hasPct      = live && live.pct_a != null;
   const isUp        = hasChange ? live.change_pct >= 0 : null;
 
   const priceLabel    = hasPrice    ? `$${live.price.toFixed(2)}`                        : "—";
@@ -101,25 +102,6 @@ function TickerRow({ sym, onClick, earningsMap, live }) {
           )}
         </div>
         <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2 }}>{subLabel}</div>
-        {hasPct ? (
-          <div style={{ marginTop: 6, width: 90 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 3 }}>
-              <span style={{
-                width: 5, height: 5, borderRadius: "50%",
-                background: live.is_live ? "var(--blue)" : "var(--text4)",
-                flexShrink: 0
-              }} />
-              <span style={{ fontSize: 9, color: live.is_live ? "var(--blue)" : "var(--text4)", letterSpacing: "0.02em" }}>
-                {live.is_live ? "Live" : "Historical"}
-              </span>
-            </div>
-            <MiniBar pct={live.pct_a}  sig={live.signal_a}  label="A" />
-            <MiniBar pct={live.pct_b}  sig={live.signal_b}  label="B" />
-            <MiniBar pct={live.pct_ep} sig={live.signal_ep} label="EP" />
-          </div>
-        ) : (
-          <div style={{ marginTop: 6, fontSize: 10, color: "var(--text4)" }}>Loading percentiles…</div>
-        )}
       </div>
       <div style={{ textAlign: "right", fontSize: 13, fontWeight: 500, color: "var(--text)" }}>{priceLabel}</div>
       <div style={{ textAlign: "right" }}>
