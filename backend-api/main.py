@@ -659,15 +659,41 @@ def get_watchlist_live():
     except Exception as e:
         print(f"Watchlist price snapshot fetch failed entirely: {e}")
 
-    # Percentile signal + straddle value per ticker: live quote (only for
-    # live_tickers) with a fallback to the historical calc, same pattern as
-    # /straddle/{ticker}. spy_cache is shared across every ticker in this
-    # batch -- most near-term tickers land on the same one or two nearest
-    # Fridays, so this turns what would be dozens of duplicate SPY calls
-    # into (at most) a couple of real ones. Run concurrently; even with the
-    # earnings-window scoping, a live lookup is several sequential Alpaca
-    # calls per ticker.
+    # Straddle value per ticker: live quote (only for live_tickers) with a
+    # fallback to the historical value. spy_cache is shared across every
+    # ticker in this batch -- most near-term tickers land on the same one or
+    # two nearest Fridays, so this turns what would be dozens of duplicate
+    # SPY calls into (at most) a couple of real ones. Run concurrently; even
+    # with the earnings-window scoping, a live lookup is several sequential
+    # Alpaca calls per ticker.
+    #
+    # NOTE: this used to route every ticker through get_straddle_percentile /
+    # get_straddle_percentile_live (same functions /scan and /analysis use)
+    # just to read back "close_a" -- those functions ALSO compute full
+    # historical percentile ranks, hist_stats, and a SPY-elevation lookup for
+    # 3 separate metrics, none of which the Watchlist tab has displayed since
+    # its percentile bars were removed (see WatchlistScreen.jsx). That meant
+    # ~500+ tickers x 15 concurrent threads of real quantile/percentileofscore
+    # work, every ~55s during market hours via the always-on prewarm loop
+    # below, purely to throw away everything except one number per ticker --
+    # a real contributor to insignia-api's repeated 512MB OOM restarts on
+    # top of the ones already fixed above (TICKER_GROUPS, market-hours
+    # gating). close_a itself needs none of that: for a live ticker,
+    # live_quotes.get_live_straddle_inputs already computes it directly
+    # (straddle mid / stock price) before get_straddle_percentile_live would
+    # even be called; for a historical ticker it's just today's
+    # closestraddle_a value off the most recent dbe=0 row. Both are now read
+    # directly, skipping the percentile machinery entirely. If the Watchlist
+    # tab ever wants percentile signals back, route it through /scan or
+    # /analysis (already used for that) rather than reintroducing this here.
     spy_cache = {}
+
+    def _latest_close_a(ticker_df):
+        bucket = ticker_df[ticker_df["dbe"] == 0]
+        if bucket.empty:
+            return None
+        today = bucket.sort_values("date").iloc[-1]
+        return float(today["closestraddle_a"])
 
     def compute_one(ticker):
         # Per-ticker slice instead of the full 80k+-row df_global -- this
@@ -687,16 +713,11 @@ def get_watchlist_live():
                 live = live_quotes.get_live_straddle_inputs(
                     ticker, er_date, er_time, _spy_cache=spy_cache, stock_price=known_price
                 )
-                result = get_straddle_percentile_live(
-                    ticker_df, ticker=ticker, dbe=0,
-                    live_close_a=live["close_a"], live_close_b=live["close_b"],
-                    live_spy_close_a=live["spy_close_a"], live_spy_close_b=live["spy_close_b"],
-                )
-                return result, True
+                return live["close_a"], True
             except Exception:
                 pass  # falls through to the historical path below
         try:
-            return get_straddle_percentile(ticker_df, ticker=ticker, dbe=0), False
+            return _latest_close_a(ticker_df), False
         except Exception:
             return None, False
 
@@ -707,17 +728,16 @@ def get_watchlist_live():
         for future in as_completed(futures):
             ticker = futures[future]
             try:
-                result, is_live = future.result()
+                straddle_pct, is_live = future.result()
             except Exception as e:
                 print(f"Watchlist live compute failed for {ticker}: {e}")
-                result, is_live = None, False
-            if result is None:
+                straddle_pct, is_live = None, False
+            if straddle_pct is None:
                 continue
 
             pdata = price_data.get(ticker)
             price = pdata["price"] if pdata else None
             change_pct = pdata["change_pct"] if pdata else None
-            straddle_pct = result.get("close_a")  # fraction of stock price, e.g. 0.037
             straddle_dollar = (straddle_pct * price) if (straddle_pct is not None and price is not None) else None
 
             results[ticker] = {
@@ -727,12 +747,6 @@ def get_watchlist_live():
                 "change_pct":      change_pct,
                 "straddle_pct":    straddle_pct,
                 "straddle_dollar": straddle_dollar,
-                "pct_a":           result.get("pct_a"),
-                "pct_b":           result.get("pct_b"),
-                "pct_ep":          result.get("pct_ep"),
-                "signal_a":        result.get("signal_a"),
-                "signal_b":        result.get("signal_b"),
-                "signal_ep":       result.get("signal_ep"),
             }
 
     response = {"tickers": results, "count": len(results)}
